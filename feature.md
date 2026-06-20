@@ -26,25 +26,32 @@ CPU is already at 80 MHz (`nodemcuv2` default), so no change there.
 - **PWM backlight dimming.** New `setBacklight(uint8_t)` helper drives GPIO5 with
   20 kHz software PWM, correctly inverted for the active-low pin (brightness 255 =
   full on, 0 = off). New `#define LCD_BRIGHTNESS 90` knob (0–255), default ~90.
+- **Runtime brightness control.** The web dashboard exposes a Brightness slider
+  backed by `GET|POST /brightness?value=0..255`; the ESP8266 stores the selected
+  value in EEPROM so the dimming level survives reboot.
 - **WiFi modem-sleep.** `WiFi.setSleepMode(WIFI_MODEM_SLEEP)` after connect, plus
   a `delay(2)` at the end of `loop()` so the SDK can actually park the radio
   between AP beacons. CPU stays on, so the web server and 1 s clock are unaffected.
 
 ## Cost / risk
 
-- **IRAM.** The PWM timer ISR lives in IRAM, which was already ~92% full. After
-  the change it links at **94% (61,659 / 65,536 bytes, ~3.8 KB headroom)**.
-  Verified with `arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2`. Further
-  IRAM-heavy additions are now tighter — watch the link step.
+- **IRAM.** The PWM timer ISR lives in IRAM. With the ESP8266 default balanced
+  MMU layout this links at **94% (61,659 / 65,536 bytes, ~3.8 KB headroom)**.
+  Build with `:mmu=4816` (`16KB cache + 48KB IRAM`) to get **69%
+  (45,291 / 65,536 bytes)** while keeping the dimmed backlight:
+  `arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:mmu=4816`.
+  Further ISR/timer-heavy additions are still risky — watch the link step.
 - **Responsiveness.** `delay(2)` adds ≤2 ms latency to HTTP requests and clock
   ticks — invisible at the once-per-second cadence the dashboard polls.
-- **Reversible.** Set `LCD_BRIGHTNESS 255` to restore old brightness; remove the
-  `setSleepMode`/`delay` lines to restore old WiFi behavior.
+- **Reversible.** Set the dashboard slider or `/brightness?value=255` to restore
+  old brightness; remove the `setSleepMode`/`delay` lines to restore old WiFi
+  behavior.
 
 ## How to verify (physical — needs a finger on the glass)
 
 1. Flash, run ~15 min, feel the glass.
-   - Cooler screen → backlight was the source (confirmed); tune `LCD_BRIGHTNESS`.
+   - Cooler screen → backlight was the source (confirmed); tune the dashboard
+     brightness slider.
    - Glass still hot, back cooler → ESP/regulator heat; modem-sleep is helping.
    - No change → regulator-dominated (normal warmth, not firmware-fixable).
 2. Decisive A/B: set `LCD_BRIGHTNESS 0`, flash, feel after 10 min — if the glass
@@ -53,5 +60,3 @@ CPU is already at 80 MHz (`nodemcuv2` default), so no change there.
 ## Possible follow-ups
 
 - Automatic night dimming on a schedule using the clock the firmware already has.
-- Expose brightness over HTTP (`/usage?bl=` or a dedicated endpoint) so the daemon
-  or dashboard can set it at runtime without reflashing.
