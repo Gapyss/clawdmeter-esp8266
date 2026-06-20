@@ -44,9 +44,21 @@ The OAuth token never leaves the Mac; the device only ever receives two integers
   CS→GND / MOSI=GPIO13 / SCK=GPIO14. Getting backlight polarity or SPI mode wrong
   = blank screen. `#define LCD_ROT` is the per-product orientation knob (HelloCubic
   Lite vs SmallTV-Ultra differ only here; try 0/2/4/6).
+- **Backlight is PWM-dimmed, not just on/off.** `setBacklight(uint8_t)` drives GPIO5
+  with 20 kHz software PWM; because the pin is active-low it inverts the duty
+  (`analogWrite(LCD_BL, 255 - brightness)`), so brightness 255 = full on, 0 = off.
+  `#define LCD_BRIGHTNESS` (default 90) sets the level — full brightness (255) ran
+  the panel hot, since the LED string behind the glass is the main heat source.
+  The PWM timer ISR lives in IRAM, so this pushed the build from ~92% → ~94% IRAM.
+- **WiFi uses modem-sleep + a `delay(2)` in `loop()`.** `WiFi.setSleepMode(WIFI_MODEM_SLEEP)`
+  lets the radio idle between AP beacons, but it only engages because `loop()` now
+  yields via `delay(2)` — without that yield the non-blocking `handleClient()` spins
+  the core flat out and the radio never sleeps (hotter, more current). Don't remove
+  the `delay()`; it's load-bearing for thermal/power, not a throttle.
 - **Arduino_GFX draws directly to the panel (no canvas/framebuffer)** — a 240×240×2
-  buffer (115 KB) would not fit ESP8266 RAM. **IRAM is at ~92%**; adding
-  `ICACHE_RAM_ATTR`/`IRAM_ATTR` code can overflow `iram1` and fail the link.
+  buffer (115 KB) would not fit ESP8266 RAM. **IRAM is at ~94%** (after the PWM ISR;
+  ~3.8 KB headroom); adding `ICACHE_RAM_ATTR`/`IRAM_ATTR` code can overflow `iram1`
+  and fail the link.
 - **Use hex color literals (`0x0000`/`0xFFFF`), not Arduino_GFX `BLACK`/`WHITE`.**
   The named macros fail to resolve inside the non-capturing lambda used for
   `wm.setAPCallback`.
@@ -111,7 +123,8 @@ prompt is approved (launchd can't answer GUI dialogs).
 
 ## Constants worth knowing before editing
 
-- Display pins / SPI / rotation: `#define`s at the top of `clawdmeter_esp8266.ino`.
+- Display pins / SPI / rotation / brightness: `#define`s at the top of
+  `clawdmeter_esp8266.ino` (`LCD_BRIGHTNESS` 0–255, default 90).
 - `DEVICE_URL`, `POLL_INTERVAL`, `KEYCHAIN_SERVICE`, `API_BODY` (model
   `claude-haiku-4-5-20251001`): top of `claudemeter_daemon.py`.
 - `CLAWDMETER_DEVICE_URL` (env override for `DEVICE_URL`),
