@@ -60,9 +60,11 @@ The OAuth token never leaves the Mac; the device only ever receives two integers
 
 ## Device HTTP endpoints (`clawdmeter_esp8266.ino`)
 
-`GET /` dashboard · `GET|POST /usage?s=&w=&st=&wt=` push values (s/w = %, st/wt = raw
-token counts) · `GET /usage.json` current state for the page poller · `/update` OTA
-upload form (ESP8266HTTPUpdateServer).
+`GET /` dashboard · `GET|POST /usage?s=&w=&st=&wt=&sr=&wr=&stat=&bind=&t=` push values
+(s/w = %, st/wt = raw token counts, sr/wr = 5h/7d reset epochs, stat = unified-status,
+bind = binding limit 1=session/2=weekly, t = server epoch for the UTC clock) ·
+`GET /usage.json` current state for the page poller · `/update` OTA upload form
+(ESP8266HTTPUpdateServer).
 
 ## Commands
 

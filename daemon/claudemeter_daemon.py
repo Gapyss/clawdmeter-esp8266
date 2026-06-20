@@ -15,8 +15,10 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 # ---- Edit if needed ----
@@ -116,11 +118,55 @@ def usage_from_headers(headers):
     )
 
 
+def int_or_zero(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+# representative-claim tells which limit is the binding one; the device draws an
+# amber stripe on that block. 1 = session (5h), 2 = weekly (7d), 0 = unknown.
+_BIND = {"five_hour": 1, "seven_day": 2}
+
+
+def extra_from_headers(headers):
+    """Reset epochs, allow/deny status, binding limit, and server clock.
+
+    These ride along with the two utilization headers and let the device show
+    real reset times + a UTC clock without an RTC or NTP.
+    """
+    server_epoch = 0
+    date_hdr = headers.get("Date")
+    if date_hdr:
+        try:
+            server_epoch = int(parsedate_to_datetime(date_hdr).timestamp())
+        except (TypeError, ValueError):
+            server_epoch = 0
+    return {
+        "sr": int_or_zero(headers.get("anthropic-ratelimit-unified-5h-reset")),
+        "wr": int_or_zero(headers.get("anthropic-ratelimit-unified-7d-reset")),
+        "stat": (headers.get("anthropic-ratelimit-unified-status") or "").strip(),
+        "bind": _BIND.get(
+            (headers.get("anthropic-ratelimit-unified-representative-claim") or "").strip(), 0),
+        "t": server_epoch,
+    }
+
+
 def retry_after_seconds(headers):
     try:
         return max(1, int(headers.get("retry-after", "")))
     except ValueError:
         return RATE_LIMIT_BACKOFF
+
+
+def base_result(**kw):
+    """A push payload with every field defaulted; pollers fill what they have."""
+    r = {"s": -1, "w": -1, "st": 0, "wt": 0,
+         "sr": 0, "wr": 0, "stat": "", "bind": 0, "t": 0,
+         "sleep": POLL_INTERVAL}
+    r.update(kw)
+    return r
 
 
 def poll_api_usage():
@@ -138,7 +184,7 @@ def poll_api_usage():
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         s, w = usage_from_headers(resp.headers)
-        return s, w, 0, 0, POLL_INTERVAL
+        return base_result(s=s, w=w, **extra_from_headers(resp.headers))
 
 
 def scan_local_usage():
@@ -192,12 +238,11 @@ def percent(tokens, limit):
 
 def poll_local_usage():
     session_tokens, weekly_tokens = scan_local_usage()
-    return (
-        percent(session_tokens, SESSION_TOKEN_LIMIT),
-        percent(weekly_tokens, WEEKLY_TOKEN_LIMIT),
-        session_tokens,
-        weekly_tokens,
-        POLL_INTERVAL,
+    return base_result(
+        s=percent(session_tokens, SESSION_TOKEN_LIMIT),
+        w=percent(weekly_tokens, WEEKLY_TOKEN_LIMIT),
+        st=session_tokens,
+        wt=weekly_tokens,
     )
 
 
@@ -209,8 +254,10 @@ def poll_usage():
     return poll_api_usage()
 
 
-def push(s, w, session_tokens, weekly_tokens):
-    url = f"{DEVICE_URL}/usage?s={s}&w={w}&st={session_tokens}&wt={weekly_tokens}"
+def push(r):
+    url = (f"{DEVICE_URL}/usage?s={r['s']}&w={r['w']}&st={r['st']}&wt={r['wt']}"
+           f"&sr={r['sr']}&wr={r['wr']}&stat={urllib.parse.quote(r['stat'])}"
+           f"&bind={r['bind']}&t={r['t']}")
     urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=5).read()
 
 
@@ -219,12 +266,13 @@ def main():
     while True:
         sleep_for = POLL_INTERVAL
         try:
-            s, w, session_tokens, weekly_tokens, sleep_for = poll_usage()
-            push(s, w, session_tokens, weekly_tokens)
+            r = poll_usage()
+            sleep_for = r["sleep"]
+            push(r)
             if USAGE_SOURCE == "local":
-                print(f"session={s}% ({session_tokens} tok)  weekly={w}% ({weekly_tokens} tok)")
+                print(f"session={r['s']}% ({r['st']} tok)  weekly={r['w']}% ({r['wt']} tok)")
             else:
-                print(f"session={s}%  weekly={w}%")
+                print(f"session={r['s']}%  weekly={r['w']}%  status={r['stat'] or '?'}")
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 print("401 Unauthorized: run any Claude Code command to refresh login.",
@@ -233,8 +281,9 @@ def main():
                 s, w = usage_from_headers(e.headers)
                 sleep_for = retry_after_seconds(e.headers)
                 if s >= 0 or w >= 0:
+                    r = base_result(s=s, w=w, **extra_from_headers(e.headers))
                     try:
-                        push(s, w, 0, 0)
+                        push(r)
                     except Exception as push_error:
                         print(f"device push failed: {push_error}", file=sys.stderr)
                     print(f"rate limited: session={s}% weekly={w}% "
