@@ -13,10 +13,11 @@ mirrors `Times-Z/GeekMagic-Open-Firmware`.
 
 ```
 Mac daemon ──poll 60s──> api.anthropic.com   (reads usage from rate-limit HEADERS)
-   └── HTTP POST /usage?s=&w= ──> ESP8266 ──> ST7789 panel  +  web dashboard
+   └── HTTP POST /usage?... ──> ESP8266 ──> ST7789 panel  +  web dashboard
 ```
 
-The OAuth token never leaves the Mac; the device only ever receives two integers.
+The OAuth token never leaves the Mac; the device only receives usage numbers,
+reset metadata, and simple Mac system metrics.
 
 ## Architecture / non-obvious facts
 
@@ -36,8 +37,8 @@ The OAuth token never leaves the Mac; the device only ever receives two integers
   (OAuth tokens are not `x-api-key`). On 401 the token expired — running any
   `claude` command refreshes it. There is no token-refresh logic by design.
 - **Device transport is HTTP query args, not JSON.** The daemon pushes
-  `POST /usage?s=<int>&w=<int>` so the firmware needs no JSON parser. Keep it this
-  way unless you add ArduinoJson for a reason.
+  `POST /usage?s=<int>&w=<int>...` so the firmware needs no JSON parser. Keep it
+  this way unless you add ArduinoJson for a reason.
 - **Display init mirrors the GeekMagic open firmware and the exact values matter.**
   In `clawdmeter_esp8266.ino`: backlight on GPIO5 is **ACTIVE-LOW** (`LOW` = on),
   panel is initialized at **SPI mode 3, 40 MHz**, pins DC=GPIO0 / RST=GPIO2 /
@@ -47,21 +48,34 @@ The OAuth token never leaves the Mac; the device only ever receives two integers
 - **Backlight is PWM-dimmed, not just on/off.** `setBacklight(uint8_t)` drives GPIO5
   with software PWM at **`LCD_PWM_FREQ` (1 kHz)**; because the pin is active-low it
   inverts the duty (`analogWrite(LCD_BL, 255 - brightness)`), so brightness 255 = full
-  on, 0 = off. `#define LCD_BRIGHTNESS` (default 90) sets the level — full brightness
-  (255) ran the panel hot, since the LED string behind the glass is the main heat
-  source. The PWM is a software waveform on an IRAM timer ISR, so its CPU cost scales
-  with frequency: **keep `LCD_PWM_FREQ` low.** It was 20 kHz, whose ~40k interrupts/sec
-  starved the WiFi/TCP stack — the device answered ping but crash-rebooted under any
-  HTTP load. 1 kHz is 1/20th the rate, still above flicker fusion.
+  on, 0 = off. `#define LCD_BRIGHTNESS` (default 90) is the first-boot/default level;
+  after that `/brightness?value=0..255` and the dashboard slider can change it at
+  runtime. The value is persisted in EEPROM with a small marker. Full brightness (255)
+  ran the panel hot, since the LED string behind the glass is the main heat source.
+  The PWM is a software waveform on an IRAM timer ISR (~2 edges/period), so its CPU
+  cost scales with frequency. **Keep `LCD_PWM_FREQ` low.** It was 20 kHz, whose
+  ~40k interrupts/sec starved the WiFi/TCP stack — the device answered ping but
+  crash-rebooted under any HTTP load (dashboard, OTA). 1 kHz is 1/20th the rate, still
+  well above flicker fusion. Build with `:mmu=4816` to keep comfortable IRAM headroom.
+- **Silence the PWM ISR around every SPI-flash write.** A PWM timer interrupt firing
+  during a flash erase/write resets the ESP8266 — OTA died at a deterministic ~127 KB
+  offset until fixed. `backlightStopForFlash()` (`analogWrite(LCD_BL, 0)` → detaches
+  the pin from the waveform generator, backlight steady full-on) is called before
+  `Update.begin` in the OTA upload handler and around `EEPROM.commit()` in
+  `saveBrightness`. If you add any new flash write, wrap it the same way. Recovery
+  trick for a board *already* stuck on the old 20 kHz firmware: `GET /brightness?value=255`
+  stops the waveform, then the OTA upload completes.
 - **WiFi uses modem-sleep + a `delay(2)` in `loop()`.** `WiFi.setSleepMode(WIFI_MODEM_SLEEP)`
   lets the radio idle between AP beacons, but it only engages because `loop()` now
   yields via `delay(2)` — without that yield the non-blocking `handleClient()` spins
   the core flat out and the radio never sleeps (hotter, more current). Don't remove
   the `delay()`; it's load-bearing for thermal/power, not a throttle.
 - **Arduino_GFX draws directly to the panel (no canvas/framebuffer)** — a 240×240×2
-  buffer (115 KB) would not fit ESP8266 RAM. **IRAM is at ~94%** (after the PWM ISR;
-  ~3.8 KB headroom); adding `ICACHE_RAM_ATTR`/`IRAM_ATTR` code can overflow `iram1`
-  and fail the link.
+  buffer (115 KB) would not fit ESP8266 RAM. Use the ESP8266 `16KB cache + 48KB IRAM`
+  MMU layout (`:mmu=4816` in the FQBN, or Tools → MMU in Arduino IDE). The balanced
+  default layout is tight at ~94% instruction RAM; `:mmu=4816` builds at ~69%
+  instruction RAM with the same code. Adding `ICACHE_RAM_ATTR`/`IRAM_ATTR` code can
+  still overflow `iram1`, so avoid new ISR/timer-heavy features.
 - **Use hex color literals (`0x0000`/`0xFFFF`), not Arduino_GFX `BLACK`/`WHITE`.**
   The named macros fail to resolve inside the non-capturing lambda used for
   `wm.setAPCallback`.
@@ -75,11 +89,17 @@ The OAuth token never leaves the Mac; the device only ever receives two integers
 
 ## Device HTTP endpoints (`clawdmeter_esp8266.ino`)
 
-`GET /` dashboard · `GET|POST /usage?s=&w=&st=&wt=&sr=&wr=&stat=&bind=&t=` push values
+`GET /` dashboard ·
+`GET|POST /usage?s=&w=&st=&wt=&sr=&wr=&stat=&bind=&t=&cpu=&mem=&disk=&bat=` push values
 (s/w = %, st/wt = raw token counts, sr/wr = 5h/7d reset epochs, stat = unified-status,
-bind = binding limit 1=session/2=weekly, t = server epoch for the UTC clock) ·
-`GET /usage.json` current state for the page poller · `/update` OTA upload form
-(ESP8266HTTPUpdateServer).
+bind = binding limit 1=session/2=weekly, t = server epoch for the UTC clock,
+cpu/mem/disk/bat = Mac system percentages) · `GET /usage.json` current state for
+the page poller, including `bl` current brightness ·
+`GET|POST /brightness?value=0..255` sets/persists TFT brightness and returns JSON ·
+`GET|POST /mode?screen=mac|claude|desk` switches the physical LCD mode ·
+`GET|POST /desk?status=coding|busy|break` pushes a preset full-screen desk status sign;
+`/desk?text=<up-to-12-safe-chars>&color=green|red|amber|blue|white` pushes custom text/color ·
+`/update` firmware-only OTA upload form.
 
 ## Commands
 
@@ -91,19 +111,19 @@ arduino-cli lib install "WiFiManager" "GFX Library for Arduino"
 
 **Compile** (the sketch folder name MUST match the `.ino` name — Arduino requirement):
 ```sh
-arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 firmware/clawdmeter_esp8266
+arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:mmu=4816 firmware/clawdmeter_esp8266
 ```
 
 **Produce the OTA binary** (libraries are baked in, so the resulting `.bin` can be
 flashed at `/update` without any IDE/library install):
 ```sh
-arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2 --output-dir firmware/bin firmware/clawdmeter_esp8266
+arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:mmu=4816 --output-dir firmware/bin firmware/clawdmeter_esp8266
 ```
 
 **Flash over USB:**
 ```sh
 arduino-cli board list                                  # find the port
-arduino-cli upload -p <PORT> --fqbn esp8266:esp8266:nodemcuv2 firmware/clawdmeter_esp8266
+arduino-cli upload -p <PORT> --fqbn esp8266:esp8266:nodemcuv2:mmu=4816 firmware/clawdmeter_esp8266
 ```
 **Flash OTA:** upload `firmware/bin/clawdmeter_esp8266.ino.bin` at
 `http://clawdmeter.local/update`. Do the *first* flash over USB — an existing
@@ -126,13 +146,16 @@ prompt is approved (launchd can't answer GUI dialogs).
 
 ## Constants worth knowing before editing
 
-- Display pins / SPI / rotation / brightness: `#define`s at the top of
-  `clawdmeter_esp8266.ino` (`LCD_BRIGHTNESS` 0–255, default 90).
+- Display pins / SPI / rotation / default brightness: `#define`s at the top of
+  `clawdmeter_esp8266.ino` (`LCD_BRIGHTNESS` 0–255, default 90). Runtime
+  brightness overrides are stored in EEPROM.
 - `DEVICE_URL`, `POLL_INTERVAL`, `KEYCHAIN_SERVICE`, `API_BODY` (model
   `claude-haiku-4-5-20251001`): top of `claudemeter_daemon.py`.
 - `CLAWDMETER_DEVICE_URL` (env override for `DEVICE_URL`),
+  `CLAWDMETER_DEVICE_TIMEOUT` / `CLAWDMETER_DEVICE_PUSH_ATTEMPTS`
+  (device push retry tuning),
   `CLAWDMETER_USAGE_SOURCE` (`api` or `local`),
   `CLAWDMETER_SESSION_TOKEN_LIMIT` / `CLAWDMETER_WEEKLY_TOKEN_LIMIT`
   (token budgets the progress bars represent in `local` mode; defaults 30M / 100M).
-- The compiled `.bin` is built for `nodemcuv2` (4 MB flash). A 1 MB board (e.g.
-  ESP-01) needs a different FQBN/flash layout for OTA.
+- The compiled `.bin` is built for `nodemcuv2` (4 MB flash) with the `mmu=4816`
+  option. A 1 MB board (e.g. ESP-01) needs a different FQBN/flash layout for OTA.
