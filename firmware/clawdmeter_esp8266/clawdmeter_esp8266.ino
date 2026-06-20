@@ -26,10 +26,15 @@ Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, LCD_ROT, true /* IPS */, 240
 
 // Backlight is ACTIVE LOW and the pin supports software PWM. analogWrite sets the
 // HIGH duty, and HIGH = off here, so invert: brightness 255 -> duty 0 (full on),
-// brightness 0 -> duty 255 (off). 20 kHz avoids visible flicker / audible whine.
+// brightness 0 -> duty 255 (off). The PWM is a software waveform on an IRAM timer
+// ISR (~2 edges/period), so its CPU cost scales with frequency. Keep LCD_PWM_FREQ
+// LOW: at 20 kHz the ~40k interrupts/sec starved the WiFi/TCP stack and the device
+// crash-rebooted under any HTTP load (it still answered ping). 1 kHz is 1/20th the
+// rate and still well above flicker fusion.
+#define LCD_PWM_FREQ 1000
 static void setBacklight(uint8_t brightness) {
   analogWriteRange(255);
-  analogWriteFreq(20000);
+  analogWriteFreq(LCD_PWM_FREQ);
   analogWrite(LCD_BL, 255 - brightness);
 }
 

@@ -45,11 +45,14 @@ The OAuth token never leaves the Mac; the device only ever receives two integers
   = blank screen. `#define LCD_ROT` is the per-product orientation knob (HelloCubic
   Lite vs SmallTV-Ultra differ only here; try 0/2/4/6).
 - **Backlight is PWM-dimmed, not just on/off.** `setBacklight(uint8_t)` drives GPIO5
-  with 20 kHz software PWM; because the pin is active-low it inverts the duty
-  (`analogWrite(LCD_BL, 255 - brightness)`), so brightness 255 = full on, 0 = off.
-  `#define LCD_BRIGHTNESS` (default 90) sets the level — full brightness (255) ran
-  the panel hot, since the LED string behind the glass is the main heat source.
-  The PWM timer ISR lives in IRAM, so this pushed the build from ~92% → ~94% IRAM.
+  with software PWM at **`LCD_PWM_FREQ` (1 kHz)**; because the pin is active-low it
+  inverts the duty (`analogWrite(LCD_BL, 255 - brightness)`), so brightness 255 = full
+  on, 0 = off. `#define LCD_BRIGHTNESS` (default 90) sets the level — full brightness
+  (255) ran the panel hot, since the LED string behind the glass is the main heat
+  source. The PWM is a software waveform on an IRAM timer ISR, so its CPU cost scales
+  with frequency: **keep `LCD_PWM_FREQ` low.** It was 20 kHz, whose ~40k interrupts/sec
+  starved the WiFi/TCP stack — the device answered ping but crash-rebooted under any
+  HTTP load. 1 kHz is 1/20th the rate, still above flicker fusion.
 - **WiFi uses modem-sleep + a `delay(2)` in `loop()`.** `WiFi.setSleepMode(WIFI_MODEM_SLEEP)`
   lets the radio idle between AP beacons, but it only engages because `loop()` now
   yields via `delay(2)` — without that yield the non-blocking `handleClient()` spins
