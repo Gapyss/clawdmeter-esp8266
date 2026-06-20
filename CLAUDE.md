@@ -70,20 +70,26 @@ reset metadata, and simple Mac system metrics.
   yields via `delay(2)` — without that yield the non-blocking `handleClient()` spins
   the core flat out and the radio never sleeps (hotter, more current). Don't remove
   the `delay()`; it's load-bearing for thermal/power, not a throttle.
-- **The dashboard `/` page (~15 KB) needs the Higher-Bandwidth lwIP variant
-  (`ip=hb2f`) AND `handleRoot` keeping the radio awake.** The page is sent in one
-  blocking `server.send_P`. With the default `ip=lm2f` (Lower Memory) lwIP, the TCP
-  send buffer is only `2×MSS` (1072 B); under `WIFI_MODEM_SLEEP` ACKs return slowly,
-  the buffer can't drain, and the write stalls and closes the connection mid-page —
-  the page truncated at an MSS multiple ~90% of the time and Chrome showed a failed
-  load (looked like the device was unreachable even though ping/`usage.json` were
-  fine). Fix is two-part: build with `ip=hb2f` (bigger send buffer/window — the
-  dominant fix) **and** `handleRoot` flips `WiFi.setSleepMode(WIFI_NONE_SLEEP)` +
-  `backlightStopForFlash()` (park the PWM ISR) for the duration of the send, then
-  restores both. Small endpoints (`/usage.json`, ~275 B) fit one segment and were
-  never affected, which is what made it look like a network problem. If you ever add
-  a comparably large response, gzip it (`Content-Encoding: gzip`) rather than relying
-  on the link sustaining a 15 KB blocking push.
+- **The dashboard `/` page is served gzipped, and that's load-bearing for
+  reliability — not just bandwidth.** The page is sent in one blocking
+  `server.send_P`. With the default `ip=lm2f` (Lower Memory) lwIP the TCP send
+  buffer is only `2×MSS` (1072 B); under `WIFI_MODEM_SLEEP` ACKs return slowly, the
+  buffer can't drain, the write stalls and closes the connection mid-page — the raw
+  15 KB page truncated at an MSS multiple ~90% of the time and Chrome showed a failed
+  load (looked unreachable even though ping/`usage.json` were fine; `/usage.json` and
+  the other small endpoints fit one segment and were never affected). The shipped fix
+  (`2742d66`, see `docs/postmortems/dashboard-truncated-send.md`) is three layers:
+  (1) build with `ip=hb2f` (Higher-Bandwidth lwIP, bigger send buffer/window);
+  (2) `handleRoot` serves a **gzipped** blob (`INDEX_HTML_GZ` in `index_html_gz.h`,
+  ~15469→4424 B, `Content-Encoding: gzip`) so the whole body fits one send-buffer
+  fill and never stalls mid-write; (3) `handleRoot` flips `WIFI_NONE_SLEEP` for the
+  send and `server.client().flush()`es before `Connection: close` to win the
+  close-race on the final segment. **`INDEX_HTML` (the raw string) stays the editable
+  source; after editing it run `python3 firmware/tools/gen_index_gz.py` to regenerate
+  the header.** That generator is also a **guard**: it fails the build if the gzipped
+  page exceeds `MAX_GZ_BYTES` (5120 B, safely under the ~5840 B `hb2f` one-buffer
+  ceiling). If you bust it, trim the dashboard HTML — don't raise the cap, that
+  reintroduces the multi-buffer stall.
 - **Arduino_GFX draws directly to the panel (no canvas/framebuffer)** — a 240×240×2
   buffer (115 KB) would not fit ESP8266 RAM. Use the ESP8266 `16KB cache + 48KB IRAM`
   MMU layout (`:mmu=4816` in the FQBN, or Tools → MMU in Arduino IDE). The balanced
