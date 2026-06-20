@@ -378,6 +378,10 @@ tick();setInterval(tick,3000);
 </script></body></html>
 )HTML";
 
+// Gzipped form of INDEX_HTML above, served by handleRoot(). Regenerate with
+// firmware/tools/gen_index_gz.py whenever INDEX_HTML changes.
+#include "index_html_gz.h"
+
 const char UPDATE_HTML[] PROGMEM = R"HTML(
 <!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -407,9 +411,26 @@ const char UPDATE_HTML[] PROGMEM = R"HTML(
 )HTML";
 
 void handleRoot() {
+  // Serve the dashboard gzipped (~15 KB -> ~4.4 KB, see index_html_gz.h). The
+  // uncompressed page took multiple TCP segments and a single blocking send_P
+  // stalled mid-write ~25% of the time when the WiFi link couldn't drain the
+  // send buffer fast enough — Chrome then showed a failed/partial load. The
+  // gzipped body fits in one send-buffer fill so the write completes in one go.
+  // Keep the radio awake for the brief send as cheap insurance against a lossy
+  // link; it's invisible (unlike parking the backlight PWM, which flashed the
+  // screen). INDEX_HTML stays the editable source; regenerate the header with
+  // firmware/tools/gen_index_gz.py after editing it.
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   server.sendHeader("Cache-Control", "no-store");
   server.sendHeader("Connection", "close");
-  server.send_P(200, "text/html", INDEX_HTML);
+  server.sendHeader("Content-Encoding", "gzip");
+  server.send_P(200, "text/html", (PGM_P)INDEX_HTML_GZ, INDEX_HTML_GZ_LEN);
+  // Drain the TX buffer before "Connection: close" tears the socket down. On a
+  // lossy link the final segment was racing the close and arriving truncated at
+  // the client (page came through as 2920/4424); flush() blocks until the
+  // outgoing data is actually sent.
+  server.client().flush();
+  WiFi.setSleepMode(WIFI_MODEM_SLEEP);
 }
 
 // Daemon pushes the numbers here:

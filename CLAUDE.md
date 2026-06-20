@@ -70,6 +70,20 @@ reset metadata, and simple Mac system metrics.
   yields via `delay(2)` — without that yield the non-blocking `handleClient()` spins
   the core flat out and the radio never sleeps (hotter, more current). Don't remove
   the `delay()`; it's load-bearing for thermal/power, not a throttle.
+- **The dashboard `/` page (~15 KB) needs the Higher-Bandwidth lwIP variant
+  (`ip=hb2f`) AND `handleRoot` keeping the radio awake.** The page is sent in one
+  blocking `server.send_P`. With the default `ip=lm2f` (Lower Memory) lwIP, the TCP
+  send buffer is only `2×MSS` (1072 B); under `WIFI_MODEM_SLEEP` ACKs return slowly,
+  the buffer can't drain, and the write stalls and closes the connection mid-page —
+  the page truncated at an MSS multiple ~90% of the time and Chrome showed a failed
+  load (looked like the device was unreachable even though ping/`usage.json` were
+  fine). Fix is two-part: build with `ip=hb2f` (bigger send buffer/window — the
+  dominant fix) **and** `handleRoot` flips `WiFi.setSleepMode(WIFI_NONE_SLEEP)` +
+  `backlightStopForFlash()` (park the PWM ISR) for the duration of the send, then
+  restores both. Small endpoints (`/usage.json`, ~275 B) fit one segment and were
+  never affected, which is what made it look like a network problem. If you ever add
+  a comparably large response, gzip it (`Content-Encoding: gzip`) rather than relying
+  on the link sustaining a 15 KB blocking push.
 - **Arduino_GFX draws directly to the panel (no canvas/framebuffer)** — a 240×240×2
   buffer (115 KB) would not fit ESP8266 RAM. Use the ESP8266 `16KB cache + 48KB IRAM`
   MMU layout (`:mmu=4816` in the FQBN, or Tools → MMU in Arduino IDE). The balanced
@@ -111,19 +125,19 @@ arduino-cli lib install "WiFiManager" "GFX Library for Arduino"
 
 **Compile** (the sketch folder name MUST match the `.ino` name — Arduino requirement):
 ```sh
-arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:mmu=4816 firmware/clawdmeter_esp8266
+arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:mmu=4816,ip=hb2f firmware/clawdmeter_esp8266
 ```
 
 **Produce the OTA binary** (libraries are baked in, so the resulting `.bin` can be
 flashed at `/update` without any IDE/library install):
 ```sh
-arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:mmu=4816 --output-dir firmware/bin firmware/clawdmeter_esp8266
+arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:mmu=4816,ip=hb2f --output-dir firmware/bin firmware/clawdmeter_esp8266
 ```
 
 **Flash over USB:**
 ```sh
 arduino-cli board list                                  # find the port
-arduino-cli upload -p <PORT> --fqbn esp8266:esp8266:nodemcuv2:mmu=4816 firmware/clawdmeter_esp8266
+arduino-cli upload -p <PORT> --fqbn esp8266:esp8266:nodemcuv2:mmu=4816,ip=hb2f firmware/clawdmeter_esp8266
 ```
 **Flash OTA:** upload `firmware/bin/clawdmeter_esp8266.ino.bin` at
 `http://clawdmeter.local/update`. Do the *first* flash over USB — an existing
@@ -158,4 +172,6 @@ prompt is approved (launchd can't answer GUI dialogs).
   `CLAWDMETER_SESSION_TOKEN_LIMIT` / `CLAWDMETER_WEEKLY_TOKEN_LIMIT`
   (token budgets the progress bars represent in `local` mode; defaults 30M / 100M).
 - The compiled `.bin` is built for `nodemcuv2` (4 MB flash) with the `mmu=4816`
-  option. A 1 MB board (e.g. ESP-01) needs a different FQBN/flash layout for OTA.
+  and `ip=hb2f` options. A 1 MB board (e.g. ESP-01) needs a different FQBN/flash
+  layout for OTA. Don't drop `ip=hb2f` — it's what makes the 15 KB dashboard load
+  reliably (see the lwIP note above).
