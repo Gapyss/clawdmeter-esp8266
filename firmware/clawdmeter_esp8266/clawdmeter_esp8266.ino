@@ -17,8 +17,21 @@ ESP8266HTTPUpdateServer httpUpdater;   // serves an OTA upload form at /update
 #define LCD_RST  2
 #define LCD_BL   5
 #define LCD_ROT  0    // change to 2/4/6 if the image is rotated or mirrored
+// Backlight brightness 0..255. Was hardwired full-on (255), which runs the panel
+// hot; the LED string behind the glass is the main "screen is hot" heat source.
+// ~90 is plenty indoors. Lower = cooler + less current (also eases the regulator).
+#define LCD_BRIGHTNESS 90
 Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, GFX_NOT_DEFINED /* CS -> GND */);
 Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, LCD_ROT, true /* IPS */, 240, 240);
+
+// Backlight is ACTIVE LOW and the pin supports software PWM. analogWrite sets the
+// HIGH duty, and HIGH = off here, so invert: brightness 255 -> duty 0 (full on),
+// brightness 0 -> duty 255 (off). 20 kHz avoids visible flicker / audible whine.
+static void setBacklight(uint8_t brightness) {
+  analogWriteRange(255);
+  analogWriteFreq(20000);
+  analogWrite(LCD_BL, 255 - brightness);
+}
 
 // Latest usage, pushed by the daemon. -1 = no data yet.
 int sessionPct = -1;            // 5-hour utilization %
@@ -370,7 +383,7 @@ void setup() {
 
   // --- Display init (mirrors the GeekMagic open firmware) ---
   pinMode(LCD_BL, OUTPUT);
-  digitalWrite(LCD_BL, LOW);          // backlight is ACTIVE LOW -> LOW = on
+  setBacklight(LCD_BRIGHTNESS);       // PWM-dimmed; full-on ran the panel hot
   // Arduino_GFX defaults ST7789 on ESP8266 to SPI_MODE2; this panel needs mode 3.
   // Start the bus ourselves and tell gfx->begin() not to reconfigure it.
   bus->begin(40000000, SPI_MODE3);
@@ -400,6 +413,11 @@ void setup() {
   }
   Serial.print("Connected: http://");
   Serial.println(WiFi.localIP());
+
+  // Let the radio idle between AP beacons instead of full active RX. Combined with
+  // the delay() in loop() (which yields to the SDK), average WiFi current drops a
+  // lot -> the ESP8266 runs cooler. CPU stays on, so the web server stays responsive.
+  WiFi.setSleepMode(WIFI_MODEM_SLEEP);
 
   // NTP in UTC (we apply the ICT offset at display time). This gives the wait
   // screen a clock before the daemon ever pushes; daemon time takes over later.
@@ -437,4 +455,8 @@ void loop() {
     lastTickEpoch = e;
     tickDynamic();
   }
+
+  // Yield to the SDK so WIFI_MODEM_SLEEP can actually engage between beacons.
+  // 2 ms is invisible to a 1 s clock tick and a page polled once per second.
+  delay(2);
 }
