@@ -139,9 +139,16 @@ arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:mmu=4816,ip=hb2f --output-d
 arduino-cli board list                                  # find the port
 arduino-cli upload -p <PORT> --fqbn esp8266:esp8266:nodemcuv2:mmu=4816,ip=hb2f firmware/clawdmeter_esp8266
 ```
-**Flash OTA:** upload `firmware/bin/clawdmeter_esp8266.ino.bin` at
-`http://clawdmeter.local/update`. Do the *first* flash over USB — an existing
-`/update` from other firmware (Tasmota/ESPHome) may reject a plain Arduino binary.
+**Flash OTA:** upload `firmware/bin/clawdmeter_esp8266.ino.bin` to `/update`,
+either via the browser form or with curl:
+```sh
+curl -F "image=@firmware/bin/clawdmeter_esp8266.ino.bin" \
+     http://clawdmeter.local/update
+# -> "Update OK. Rebooting..."; device is back in ~8 s. Re-poll to confirm:
+#    curl -s http://clawdmeter.local/usage.json   (check "up" reset to a low value)
+```
+Do the *first* flash over USB — an existing `/update` from other firmware
+(Tasmota/ESPHome) may reject a plain Arduino binary.
 
 **Daemon:**
 ```sh
