@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""Clawdmeter daemon (macOS).
+
+Pushes two usage percentages to an ESP8266 web dashboard over HTTP.
+
+By default it uses Anthropic response headers, which are the closest match for
+Claude's real server-side usage limits. Set CLAWDMETER_USAGE_SOURCE=local to use
+Claude Code's local JSONL transcripts instead.
+
+Runs on system Python 3, no pip installs.
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# ---- Edit if needed ----
+DEVICE_URL = os.environ.get("CLAWDMETER_DEVICE_URL", "http://clawdmeter.local")
+POLL_INTERVAL = 60                       # seconds
+USAGE_SOURCE = os.environ.get("CLAWDMETER_USAGE_SOURCE", "api").lower()
+RATE_LIMIT_BACKOFF = 10 * 60             # seconds when API does not send Retry-After
+
+# Local-log mode cannot know Anthropic's real server-side rate limit. Set these
+# to the token budgets you want the ESP progress bars to represent.
+SESSION_TOKEN_LIMIT = int(os.environ.get("CLAWDMETER_SESSION_TOKEN_LIMIT", "30000000"))
+WEEKLY_TOKEN_LIMIT = int(os.environ.get("CLAWDMETER_WEEKLY_TOKEN_LIMIT", "100000000"))
+# ------------------------
+
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+API_URL = "https://api.anthropic.com/v1/messages"
+API_BODY = {
+    "model": "claude-haiku-4-5-20251001",
+    "max_tokens": 1,
+    "messages": [{"role": "user", "content": "hi"}],
+}
+
+PROJECT_DIRS = (
+    Path.home() / ".claude" / "projects",
+    Path.home() / "Library" / "Developer" / "Xcode" /
+    "CodingAssistant" / "ClaudeAgentConfig" / "projects",
+)
+
+
+def parse_timestamp(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def turn_tokens(record):
+    """Return (timestamp, token_count, message_id) for assistant usage records."""
+    if record.get("type") != "assistant":
+        return None
+
+    msg = record.get("message") or {}
+    usage = msg.get("usage") or {}
+    tokens = (
+        (usage.get("input_tokens") or 0) +
+        (usage.get("output_tokens") or 0) +
+        (usage.get("cache_read_input_tokens") or 0) +
+        (usage.get("cache_creation_input_tokens") or 0)
+    )
+    if tokens <= 0:
+        return None
+
+    ts = parse_timestamp(record.get("timestamp"))
+    if ts is None:
+        return None
+
+    return ts, tokens, msg.get("id") or ""
+
+
+def get_token():
+    """Read the Claude Code OAuth access token from the macOS Keychain."""
+    out = subprocess.check_output(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+        text=True,
+    ).strip()
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return out
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            tok = node.get("accessToken")
+            if isinstance(tok, str):
+                return tok
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    raise RuntimeError("accessToken not found in Keychain item")
+
+
+def pct(value):
+    """Header utilization is a 0..1 fraction; convert to an integer percent."""
+    try:
+        return round(float(value) * 100)
+    except (TypeError, ValueError):
+        return -1
+
+
+def usage_from_headers(headers):
+    return (
+        pct(headers.get("anthropic-ratelimit-unified-5h-utilization")),
+        pct(headers.get("anthropic-ratelimit-unified-7d-utilization")),
+    )
+
+
+def retry_after_seconds(headers):
+    try:
+        return max(1, int(headers.get("retry-after", "")))
+    except ValueError:
+        return RATE_LIMIT_BACKOFF
+
+
+def poll_api_usage():
+    """Make a 1-token request and read real server-side quota usage headers."""
+    req = urllib.request.Request(
+        API_URL,
+        data=json.dumps(API_BODY).encode(),
+        headers={
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+            "Authorization": f"Bearer {get_token()}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        s, w = usage_from_headers(resp.headers)
+        return s, w, 0, 0, POLL_INTERVAL
+
+
+def scan_local_usage():
+    """Read Claude Code JSONL transcripts and return token totals for 5h and 7d."""
+    now = datetime.now(timezone.utc)
+    session_start = now - timedelta(hours=5)
+    weekly_start = now - timedelta(days=7)
+    latest_by_message = {}
+    turns_without_id = []
+
+    for base in PROJECT_DIRS:
+        if not base.exists():
+            continue
+        for path in base.rglob("*.jsonl"):
+            try:
+                with path.open(encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        parsed = turn_tokens(record)
+                        if not parsed:
+                            continue
+
+                        ts, tokens, message_id = parsed
+                        if ts < weekly_start:
+                            continue
+
+                        # Claude Code can write multiple streaming records for
+                        # one message; keep the latest tally for that message.
+                        if message_id:
+                            latest_by_message[message_id] = (ts, tokens)
+                        else:
+                            turns_without_id.append((ts, tokens))
+            except OSError as e:
+                print(f"warning: cannot read {path}: {e}", file=sys.stderr)
+
+    turns = list(latest_by_message.values()) + turns_without_id
+    session_tokens = sum(tokens for ts, tokens in turns if ts >= session_start)
+    weekly_tokens = sum(tokens for _ts, tokens in turns)
+    return session_tokens, weekly_tokens
+
+
+def percent(tokens, limit):
+    if limit <= 0:
+        return -1
+    return min(100, round(tokens * 100 / limit))
+
+
+def poll_local_usage():
+    session_tokens, weekly_tokens = scan_local_usage()
+    return (
+        percent(session_tokens, SESSION_TOKEN_LIMIT),
+        percent(weekly_tokens, WEEKLY_TOKEN_LIMIT),
+        session_tokens,
+        weekly_tokens,
+        POLL_INTERVAL,
+    )
+
+
+def poll_usage():
+    if USAGE_SOURCE == "local":
+        return poll_local_usage()
+    if USAGE_SOURCE != "api":
+        raise RuntimeError("CLAWDMETER_USAGE_SOURCE must be 'api' or 'local'")
+    return poll_api_usage()
+
+
+def push(s, w, session_tokens, weekly_tokens):
+    url = f"{DEVICE_URL}/usage?s={s}&w={w}&st={session_tokens}&wt={weekly_tokens}"
+    urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=5).read()
+
+
+def main():
+    print(f"Clawdmeter daemon -> {DEVICE_URL}, source={USAGE_SOURCE}, polling every {POLL_INTERVAL}s")
+    while True:
+        sleep_for = POLL_INTERVAL
+        try:
+            s, w, session_tokens, weekly_tokens, sleep_for = poll_usage()
+            push(s, w, session_tokens, weekly_tokens)
+            if USAGE_SOURCE == "local":
+                print(f"session={s}% ({session_tokens} tok)  weekly={w}% ({weekly_tokens} tok)")
+            else:
+                print(f"session={s}%  weekly={w}%")
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                print("401 Unauthorized: run any Claude Code command to refresh login.",
+                      file=sys.stderr)
+            elif e.code == 429:
+                s, w = usage_from_headers(e.headers)
+                sleep_for = retry_after_seconds(e.headers)
+                if s >= 0 or w >= 0:
+                    try:
+                        push(s, w, 0, 0)
+                    except Exception as push_error:
+                        print(f"device push failed: {push_error}", file=sys.stderr)
+                    print(f"rate limited: session={s}% weekly={w}% "
+                          f"(retrying in {sleep_for}s)", file=sys.stderr)
+                else:
+                    print(f"rate limited by Anthropic API "
+                          f"(retrying in {sleep_for}s)", file=sys.stderr)
+            else:
+                print(f"API error {e.code}: {e.reason}", file=sys.stderr)
+        except Exception as e:
+            print(f"error: {e}", file=sys.stderr)
+        time.sleep(sleep_for)
+
+
+if __name__ == "__main__":
+    main()
