@@ -2,3 +2,5 @@
 firmware/bin/
 daemon/clawdmeter.log
 daemon/clawdmeter.err.log
+build/
+dist/
