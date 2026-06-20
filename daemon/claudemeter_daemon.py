@@ -11,6 +11,9 @@ Runs on system Python 3, no pip installs.
 """
 import json
 import os
+import re
+import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -24,8 +27,11 @@ from pathlib import Path
 # ---- Edit if needed ----
 DEVICE_URL = os.environ.get("CLAWDMETER_DEVICE_URL", "http://clawdmeter.local")
 POLL_INTERVAL = 60                       # seconds
-USAGE_SOURCE = os.environ.get("CLAWDMETER_USAGE_SOURCE", "api").lower()
+RAW_USAGE_SOURCE = os.environ.get("CLAWDMETER_USAGE_SOURCE", "api").lower()
+USAGE_SOURCE = {"server": "api", "headers": "api"}.get(RAW_USAGE_SOURCE, RAW_USAGE_SOURCE)
 RATE_LIMIT_BACKOFF = 10 * 60             # seconds when API does not send Retry-After
+DEVICE_TIMEOUT = float(os.environ.get("CLAWDMETER_DEVICE_TIMEOUT", "5"))
+DEVICE_PUSH_ATTEMPTS = int(os.environ.get("CLAWDMETER_DEVICE_PUSH_ATTEMPTS", "3"))
 
 # Local-log mode cannot know Anthropic's real server-side rate limit. Set these
 # to the token budgets you want the ESP progress bars to represent.
@@ -160,10 +166,81 @@ def retry_after_seconds(headers):
         return RATE_LIMIT_BACKOFF
 
 
+def run_text(cmd):
+    try:
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+
+
+def bounded_pct(value):
+    try:
+        return max(0, min(100, round(float(value))))
+    except (TypeError, ValueError):
+        return -1
+
+
+def cpu_percent():
+    out = run_text(["ps", "-A", "-o", "%cpu="])
+    total = 0.0
+    for line in out.splitlines():
+        try:
+            total += float(line.strip())
+        except ValueError:
+            pass
+    cores = os.cpu_count() or 1
+    return bounded_pct(total / cores)
+
+
+def memory_percent():
+    vm = run_text(["vm_stat"])
+
+    pages = {}
+    for line in vm.splitlines():
+        m = re.match(r"Pages ([^:]+):\s+([0-9.]+)", line)
+        if m:
+            pages[m.group(1)] = int(m.group(2).replace(".", ""))
+
+    free = pages.get("free", 0) + pages.get("speculative", 0)
+    used = (
+        pages.get("active", 0) +
+        pages.get("wired down", 0) +
+        pages.get("occupied by compressor", 0)
+    )
+    total = free + used + pages.get("inactive", 0)
+    if total <= 0:
+        return -1
+    return bounded_pct(used * 100 / total)
+
+
+def disk_percent():
+    try:
+        usage = shutil.disk_usage(str(Path.home()))
+    except OSError:
+        return -1
+    return bounded_pct(usage.used * 100 / usage.total)
+
+
+def battery_percent():
+    out = run_text(["pmset", "-g", "batt"])
+    m = re.search(r"(\d+)%", out)
+    return bounded_pct(m.group(1)) if m else -1
+
+
+def mac_metrics():
+    return {
+        "cpu": cpu_percent(),
+        "mem": memory_percent(),
+        "disk": disk_percent(),
+        "bat": battery_percent(),
+    }
+
+
 def base_result(**kw):
     """A push payload with every field defaulted; pollers fill what they have."""
     r = {"s": -1, "w": -1, "st": 0, "wt": 0,
          "sr": 0, "wr": 0, "stat": "", "bind": 0, "t": 0,
+         "cpu": -1, "mem": -1, "disk": -1, "bat": -1,
          "sleep": POLL_INTERVAL}
     r.update(kw)
     return r
@@ -182,9 +259,16 @@ def poll_api_usage():
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        s, w = usage_from_headers(resp.headers)
-        return base_result(s=s, w=w, **extra_from_headers(resp.headers))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            s, w = usage_from_headers(resp.headers)
+            return base_result(s=s, w=w, **extra_from_headers(resp.headers))
+    except (TimeoutError, socket.timeout) as e:
+        raise TimeoutError("Anthropic API poll timed out after 30s") from e
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, socket.timeout):
+            raise TimeoutError("Anthropic API poll timed out after 30s") from e
+        raise
 
 
 def scan_local_usage():
@@ -250,15 +334,48 @@ def poll_usage():
     if USAGE_SOURCE == "local":
         return poll_local_usage()
     if USAGE_SOURCE != "api":
-        raise RuntimeError("CLAWDMETER_USAGE_SOURCE must be 'api' or 'local'")
+        raise RuntimeError("CLAWDMETER_USAGE_SOURCE must be 'api', 'server', 'headers', or 'local'")
     return poll_api_usage()
 
 
 def push(r):
     url = (f"{DEVICE_URL}/usage?s={r['s']}&w={r['w']}&st={r['st']}&wt={r['wt']}"
            f"&sr={r['sr']}&wr={r['wr']}&stat={urllib.parse.quote(r['stat'])}"
-           f"&bind={r['bind']}&t={r['t']}")
-    urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=5).read()
+           f"&bind={r['bind']}&t={r['t']}"
+           f"&cpu={r['cpu']}&mem={r['mem']}&disk={r['disk']}&bat={r['bat']}")
+    last_error = None
+    attempts = max(1, DEVICE_PUSH_ATTEMPTS)
+    for attempt in range(1, attempts + 1):
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(url, method="POST"),
+                timeout=DEVICE_TIMEOUT,
+            ).read()
+            return
+        except urllib.error.HTTPError:
+            raise
+        except (TimeoutError, socket.timeout) as e:
+            last_error = e
+        except urllib.error.URLError as e:
+            last_error = e
+            if not isinstance(e.reason, socket.timeout) and attempt == attempts:
+                raise
+
+        if attempt < attempts:
+            time.sleep(min(2.0, 0.5 * attempt))
+
+    if isinstance(last_error, (TimeoutError, socket.timeout)):
+        raise TimeoutError(
+            f"device push timed out after {DEVICE_TIMEOUT:g}s "
+            f"({attempts} attempts): {DEVICE_URL}/usage"
+        ) from last_error
+    if isinstance(last_error, urllib.error.URLError):
+        if isinstance(last_error.reason, socket.timeout):
+            raise TimeoutError(
+                f"device push timed out after {DEVICE_TIMEOUT:g}s "
+                f"({attempts} attempts): {DEVICE_URL}/usage"
+            ) from last_error
+        raise last_error
 
 
 def main():
@@ -267,12 +384,15 @@ def main():
         sleep_for = POLL_INTERVAL
         try:
             r = poll_usage()
+            r.update(mac_metrics())
             sleep_for = r["sleep"]
             push(r)
             if USAGE_SOURCE == "local":
-                print(f"session={r['s']}% ({r['st']} tok)  weekly={r['w']}% ({r['wt']} tok)")
+                print(f"session={r['s']}% ({r['st']} tok)  weekly={r['w']}% ({r['wt']} tok)  "
+                      f"cpu={r['cpu']}% mem={r['mem']}%")
             else:
-                print(f"session={r['s']}%  weekly={r['w']}%  status={r['stat'] or '?'}")
+                print(f"session={r['s']}%  weekly={r['w']}%  status={r['stat'] or '?'}  "
+                      f"cpu={r['cpu']}% mem={r['mem']}%")
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 print("401 Unauthorized: run any Claude Code command to refresh login.",
@@ -282,6 +402,7 @@ def main():
                 sleep_for = retry_after_seconds(e.headers)
                 if s >= 0 or w >= 0:
                     r = base_result(s=s, w=w, **extra_from_headers(e.headers))
+                    r.update(mac_metrics())
                     try:
                         push(r)
                     except Exception as push_error:
@@ -293,6 +414,8 @@ def main():
                           f"(retrying in {sleep_for}s)", file=sys.stderr)
             else:
                 print(f"API error {e.code}: {e.reason}", file=sys.stderr)
+        except TimeoutError as e:
+            print(f"timeout: {e}", file=sys.stderr)
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)
         time.sleep(sleep_for)
