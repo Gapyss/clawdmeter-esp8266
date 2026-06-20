@@ -51,8 +51,22 @@ dot/word), and there is no clock/countdown.
 
 ## Waiting state (no data yet)
 
-Shown when both `sessionPct` and `weeklyPct` are still −1. The status band and
-IP panel still render; the middle shows `waiting for / daemon...`.
+Shown when both `sessionPct` and `weeklyPct` are still −1. The device has no
+daemon time yet, so the clock comes from **NTP** (`configTime`, synced once WiFi
+is up) — `nowEpoch()` falls back to it until the first push. The big clock/date
+refresh **once a minute** (`drawWaitingTime` from `loop`); both are in ICT.
+
+```
+┌────────────────────────────────────────┐
+│                                        │
+│                14:06                   │  textSize 4, NTP clock (ICT)
+│             sat 20 jun                 │  textSize 2, gray (civil_from_days)
+│         ──────────────────             │
+│          waiting for daemon            │
+│                                        │
+│ IP  192.168.1.42                       │  same IP panel as the data screen
+└────────────────────────────────────────┘
+```
 
 ## Bar / status colors
 

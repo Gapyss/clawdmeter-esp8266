@@ -5,6 +5,7 @@
 #include <DNSServer.h>
 #include <WiFiManager.h>          // install "WiFiManager" by tzapu via Library Manager
 #include <Arduino_GFX_Library.h>  // install "GFX Library for Arduino" by moononournation
+#include <time.h>                 // NTP clock (so the wait screen has time before any push)
 
 ESP8266WebServer server(80);
 ESP8266HTTPUpdateServer httpUpdater;   // serves an OTA upload form at /update
@@ -37,10 +38,13 @@ unsigned long timeBaseEpoch = 0;   // server epoch at the moment of the last pus
 unsigned long timeBaseMillis = 0;  // millis() at that same moment
 unsigned long lastTickEpoch = 0;   // last second we redrew the clock/countdown
 
-// Current UTC epoch, extrapolated from the last sync via millis(). 0 = unsynced.
+// Current UTC epoch. Prefer the daemon-pushed server time (extrapolated via
+// millis()); before the first push, fall back to NTP. 0 = no time source yet.
 unsigned long nowEpoch() {
-  if (timeBaseEpoch == 0) return 0;
-  return timeBaseEpoch + (millis() - timeBaseMillis) / 1000UL;
+  if (timeBaseEpoch != 0)
+    return timeBaseEpoch + (millis() - timeBaseMillis) / 1000UL;
+  time_t t = time(nullptr);
+  return (t > 1700000000) ? (unsigned long)t : 0;   // >2023 => NTP has synced
 }
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
@@ -171,6 +175,8 @@ void handleUsageJson() {
 #define TZ_LABEL  "ICT"
 
 static const char *const DOW[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+static const char *const MON[12] = {"Jan","Feb","Mar","Apr","May","Jun",
+                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
 
 static uint16_t barColor(int p) {
   if (p >= 90) return C_RED;
@@ -261,6 +267,58 @@ static void drawIpPanel() {
   gfx->print(WiFi.localIP());
 }
 
+// Calendar date from a (TZ-adjusted) epoch — Howard Hinnant's civil_from_days.
+static void civilFromEpoch(unsigned long e, int &year, int &month, int &day) {
+  long z = (long)(e / 86400UL) + 719468;
+  long era = (z >= 0 ? z : z - 146096) / 146097;
+  long doe = z - era * 146097;                                // [0, 146096]
+  long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  long y = yoe + era * 400;
+  long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);         // [0, 365]
+  long mp = (5 * doy + 2) / 153;                              // [0, 11]
+  day = (int)(doy - (153 * mp + 2) / 5 + 1);                 // [1, 31]
+  month = (int)(mp < 10 ? mp + 3 : mp - 9);                  // [1, 12]
+  year = (int)(y + (month <= 2));
+}
+
+// "sat 20 jun" from a TZ-adjusted epoch.
+static String dateLine(unsigned long e) {
+  int yr, mo, da;
+  civilFromEpoch(e, yr, mo, da);
+  String s = String(DOW[(int)((e / 86400UL + 4) % 7)]) + " " + String(da) + " " + MON[mo - 1];
+  s.toLowerCase();
+  return s;
+}
+
+// Big HH:MM + date on the wait screen (the only parts that change each minute).
+static void drawWaitingTime() {
+  unsigned long e = nowEpoch();
+  unsigned long le = e ? e + TZ_OFFSET : 0;        // Thailand time
+  String t = e ? hhmm(le) : String("--:--");
+  gfx->fillRect(0, 40, 240, 40, C_BLACK);
+  gfx->setTextSize(4);
+  gfx->setTextColor(C_WHITE, C_BLACK);
+  gfx->setCursor((240 - (int)t.length() * 24) / 2, 44);
+  gfx->print(t);
+
+  String d = e ? dateLine(le) : String("--");
+  gfx->fillRect(0, 90, 240, 18, C_BLACK);
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_GRAY, C_BLACK);
+  gfx->setCursor((240 - (int)d.length() * 12) / 2, 92);
+  gfx->print(d);
+}
+
+static void drawWaiting() {
+  drawWaitingTime();
+  gfx->drawFastHLine(30, 124, 180, C_LINE);
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_WHITE, C_BLACK);
+  gfx->setCursor(12, 140);
+  gfx->print("waiting for daemon");
+  drawIpPanel();
+}
+
 // Redraw only the once-per-second fields (clock + session countdown) so the
 // rest of the screen doesn't flicker on every tick.
 void tickDynamic() {
@@ -276,6 +334,8 @@ void tickDynamic() {
 
 void drawMeter() {
   gfx->fillScreen(C_BLACK);
+
+  if (sessionPct < 0 && weeklyPct < 0) { drawWaiting(); return; }
 
   // Status band: "CLAUDE USAGE" title + status dot/word + Thailand-time clock.
   gfx->setTextSize(1);
@@ -295,15 +355,6 @@ void drawMeter() {
   printRight(236, 9, 1, e ? hhmmss(e + TZ_OFFSET) + " " TZ_LABEL
                           : String("--:--:-- " TZ_LABEL), C_WHITE, C_BLACK);
   gfx->drawFastHLine(0, 27, 240, C_LINE);
-
-  if (sessionPct < 0 && weeklyPct < 0) {
-    gfx->setTextSize(2);
-    gfx->setTextColor(C_WHITE, C_BLACK);
-    gfx->setCursor(20, 90);  gfx->print("waiting for");
-    gfx->setCursor(20, 115); gfx->print("daemon...");
-    drawIpPanel();
-    return;
-  }
 
   drawBlock(28, "SESSION 5h", sessionPct, sessReset, bindingLimit == 1, true);
   gfx->drawFastHLine(0, 113, 240, C_LINE);
@@ -350,6 +401,10 @@ void setup() {
   Serial.print("Connected: http://");
   Serial.println(WiFi.localIP());
 
+  // NTP in UTC (we apply the ICT offset at display time). This gives the wait
+  // screen a clock before the daemon ever pushes; daemon time takes over later.
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
   // Stable hostname so the daemon/browser don't chase IPs: http://clawdmeter.local/
   if (MDNS.begin("clawdmeter")) {
     MDNS.addService("http", "tcp", 80);
@@ -371,9 +426,14 @@ void loop() {
   MDNS.update();
   server.handleClient();
 
-  // Tick the clock + countdown once per second without redrawing the whole UI.
   unsigned long e = nowEpoch();
-  if (e != 0 && e != lastTickEpoch) {
+  if (e == 0) return;
+  if (sessionPct < 0 && weeklyPct < 0) {
+    // Wait screen: refresh the big clock/date once a minute.
+    unsigned long minute = e / 60UL;
+    if (minute != lastTickEpoch) { lastTickEpoch = minute; drawWaitingTime(); }
+  } else if (e != lastTickEpoch) {
+    // With data: tick the clock + countdown once a second, no full redraw.
     lastTickEpoch = e;
     tickDynamic();
   }
