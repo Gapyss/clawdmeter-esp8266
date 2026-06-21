@@ -36,6 +36,9 @@ reset metadata, and simple Mac system metrics.
   `Authorization: Bearer <token>` **plus** `anthropic-beta: oauth-2025-04-20`
   (OAuth tokens are not `x-api-key`). On 401 the token expired — running any
   `claude` command refreshes it. There is no token-refresh logic by design.
+  Claude/API failures are not allowed to block Mac metrics: the daemon falls back
+  to a best-effort `/usage` push with unavailable usage fields plus live
+  CPU/memory/disk/battery values, and tags `stat` with a `claude_*` reason.
 - **Device transport is HTTP query args, not JSON.** The daemon pushes
   `POST /usage?s=<int>&w=<int>...` so the firmware needs no JSON parser. Keep it
   this way unless you add ArduinoJson for a reason.

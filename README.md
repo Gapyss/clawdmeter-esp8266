@@ -79,7 +79,9 @@ python3 daemon/claudemeter_daemon.py
 - It prints Claude usage plus Mac CPU/memory each minute; the dashboard updates
   within ~3s.
 - If you see `401 Unauthorized`, your Claude Code login expired — run any
-  `claude` command to refresh it, then restart the daemon.
+  `claude` command to refresh it, then restart the daemon. While Claude usage is
+  unavailable, the daemon still pushes Mac CPU/memory/disk/battery metrics so the
+  Mac screen keeps updating.
 - Device pushes default to a 5 second timeout and 3 attempts, which helps when the
   ESP8266 is still settling after a reboot. Override with
   `CLAWDMETER_DEVICE_TIMEOUT` or `CLAWDMETER_DEVICE_PUSH_ATTEMPTS` if your WiFi is

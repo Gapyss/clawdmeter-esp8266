@@ -378,6 +378,17 @@ def push(r):
         raise last_error
 
 
+def push_mac_only(reason):
+    """Best-effort push of Mac metrics when Claude usage polling is unavailable."""
+    r = base_result(stat=reason)
+    r.update(mac_metrics())
+    try:
+        push(r)
+        print(f"mac-only: {reason}  cpu={r['cpu']}% mem={r['mem']}%")
+    except Exception as push_error:
+        print(f"device push failed: {push_error}", file=sys.stderr)
+
+
 def main():
     print(f"Clawdmeter daemon -> {DEVICE_URL}, source={USAGE_SOURCE}, polling every {POLL_INTERVAL}s")
     while True:
@@ -397,6 +408,7 @@ def main():
             if e.code == 401:
                 print("401 Unauthorized: run any Claude Code command to refresh login.",
                       file=sys.stderr)
+                push_mac_only("claude_auth")
             elif e.code == 429:
                 s, w = usage_from_headers(e.headers)
                 sleep_for = retry_after_seconds(e.headers)
@@ -412,12 +424,19 @@ def main():
                 else:
                     print(f"rate limited by Anthropic API "
                           f"(retrying in {sleep_for}s)", file=sys.stderr)
+                    push_mac_only("claude_rate_limited")
             else:
                 print(f"API error {e.code}: {e.reason}", file=sys.stderr)
+                push_mac_only("claude_http_error")
         except TimeoutError as e:
             print(f"timeout: {e}", file=sys.stderr)
+            push_mac_only("claude_timeout")
+        except urllib.error.URLError as e:
+            print(f"network error: {e}", file=sys.stderr)
+            push_mac_only("claude_network_error")
         except Exception as e:
             print(f"error: {e}", file=sys.stderr)
+            push_mac_only("claude_unavailable")
         time.sleep(sleep_for)
 
 
