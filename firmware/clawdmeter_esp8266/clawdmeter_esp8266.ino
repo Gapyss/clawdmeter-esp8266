@@ -125,7 +125,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Clawdmeter</title>
 <style>
-  :root{color-scheme:dark;--bg:#0d1117;--panel:#161b22;--panel2:#10151d;--line:#30363d;--text:#f0f6fc;--muted:#8b949e;--green:#3fb950;--yellow:#d29922;--red:#f85149;--blue:#58a6ff}
+  :root{color-scheme:dark;--bg:#0d1117;--panel:#161b22;--panel2:#10151d;--line:#30363d;--text:#f0f6fc;--muted:#8b949e;--green:#3fb950;--yellow:#d29922;--red:#f85149;--blue:#58a6ff;--claude:#d97757}
   *{box-sizing:border-box}
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--text);margin:0;min-height:100vh}
   main{width:min(980px,100%);margin:0 auto;padding:22px;display:grid;gap:16px}
@@ -188,8 +188,8 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <section class="panel">
   <div class="label"><span class="name">Device</span><span class="muted" id="mode">waiting</span></div>
   <div class="actions"><a class="btn" href="/usage.json">Usage JSON</a><a class="btn" href="/update">OTA Update</a><a class="btn" href="/restart" id="restartDevice">Restart</a><a class="btn danger" href="/factory-reset" id="factoryReset">Reset Settings</a></div>
-  <div class="control"><span class="muted">Desk</span><div class="actions"><button class="btn deskBtn" data-status="coding">Coding</button><button class="btn deskBtn" data-status="busy">Busy</button><button class="btn deskBtn" data-status="break">Break</button></div><span class="v" id="deskValue">--</span></div>
-  <div class="control"><span class="muted">Custom</span><div class="deskCustom"><input id="deskText" type="text" maxlength="12" value="CODING"><select id="deskColor"><option value="green">Green</option><option value="red">Red</option><option value="amber">Amber</option><option value="blue">Blue</option><option value="white">White</option></select><button class="btn" id="deskApply">Apply</button></div><span></span></div>
+  <div class="control"><span class="muted">Desk</span><div class="actions"><button class="btn deskBtn" data-status="coding">Coding</button><button class="btn deskBtn" data-status="claude">Claude</button><button class="btn deskBtn" data-status="busy">Busy</button><button class="btn deskBtn" data-status="break">Break</button></div><span class="v" id="deskValue">--</span></div>
+  <div class="control"><span class="muted">Custom</span><div class="deskCustom"><input id="deskText" type="text" maxlength="12" value="CODING"><select id="deskColor"><option value="green">Green</option><option value="claude">Claude</option><option value="red">Red</option><option value="amber">Amber</option><option value="blue">Blue</option><option value="white">White</option></select><button class="btn" id="deskApply">Apply</button></div><span></span></div>
   <div class="control"><span class="muted">Brightness</span><input id="brightness" type="range" min="0" max="120" value="90"><span class="v" id="brightnessValue">90</span></div>
 </section>
 </main>
@@ -321,7 +321,7 @@ async function tick(){
       document.getElementById('stok').textContent=now?utcClock(now):'--:--:--';
       document.getElementById('wtok').textContent=ageText(d.age);
       st.textContent='DESK - '+(d.deskText||d.desk||'coding').toUpperCase();
-      dot.style.background=d.deskColor=='red'?'var(--red)':d.deskColor=='amber'?'var(--yellow)':d.deskColor=='blue'?'var(--blue)':d.deskColor=='white'?'var(--text)':'var(--green)';
+      dot.style.background=d.deskColor=='red'?'var(--red)':d.deskColor=='amber'?'var(--yellow)':d.deskColor=='blue'?'var(--blue)':d.deskColor=='white'?'var(--text)':d.deskColor=='claude'?'var(--claude)':'var(--green)';
       document.getElementById('mode').textContent='desk status sign';
     }else if(view=='mac'){
       document.getElementById('title').textContent='Mac Monitor';
@@ -460,6 +460,12 @@ void handleUsage() {
 }
 
 // The dashboard page polls this.
+static String screenName() {
+  if (lcdScreen == SCREEN_DESK) return "desk";
+  if (lcdScreen == SCREEN_MAC) return "mac";
+  return "claude";
+}
+
 void handleUsageJson() {
   long age = (sessionPct < 0) ? -1 : (long)((millis() - lastUpdateMs) / 1000);
   String j = "{\"s\":" + String(sessionPct) +
@@ -474,7 +480,7 @@ void handleUsageJson() {
              ",\"mem\":" + String(macMemPct) +
              ",\"disk\":" + String(macDiskPct) +
              ",\"bat\":" + String(macBatteryPct) +
-             ",\"screen\":\"" + String(lcdScreen == SCREEN_DESK ? "desk" : lcdScreen == SCREEN_MAC ? "mac" : "claude") + "\"" +
+             ",\"screen\":\"" + screenName() + "\"" +
              ",\"desk\":\"" + deskStatus + "\"" +
              ",\"deskText\":\"" + deskText + "\"" +
              ",\"deskColor\":\"" + deskColorName + "\"" +
@@ -521,7 +527,7 @@ void handleMode() {
     }
   }
   server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", lcdScreen == SCREEN_DESK ? "desk" : lcdScreen == SCREEN_MAC ? "mac" : "claude");
+  server.send(200, "text/plain", screenName());
 }
 
 static String sanitizedDeskText(String text) {
@@ -541,7 +547,7 @@ static String sanitizedDeskText(String text) {
 
 static bool validDeskColor(const String &color) {
   return color == "green" || color == "red" || color == "amber" ||
-         color == "blue" || color == "white";
+         color == "blue" || color == "white" || color == "claude";
 }
 
 void handleDesk() {
@@ -549,7 +555,7 @@ void handleDesk() {
   if (server.hasArg("status")) {
     String status = server.arg("status");
     status.toLowerCase();
-    if (status == "coding" || status == "busy" || status == "break") {
+    if (status == "coding" || status == "busy" || status == "break" || status == "claude") {
       deskStatus = status;
       if (status == "busy") {
         deskText = "BUSY";
@@ -557,6 +563,9 @@ void handleDesk() {
       } else if (status == "break") {
         deskText = "BREAK";
         deskColorName = "amber";
+      } else if (status == "claude") {
+        deskText = "CLAUDE";
+        deskColorName = "claude";
       } else {
         deskText = "CODING";
         deskColorName = "green";
@@ -631,7 +640,7 @@ void handleFactoryReset() {
 #define C_RED    0xF800
 #define C_BLUE   0x041F
 #define C_AMBER  0xFD20
-#define C_PANEL  0x2104   // IP panel background
+#define C_CLAUDE 0xDBAA   // warm Claude-style orange accent (#D97757-ish)
 
 // Display clock/reset times in Thailand time. Pushed epochs are UTC; add the
 // offset only when formatting wall-clock text (durations/countdowns stay raw).
@@ -659,21 +668,72 @@ static uint16_t deskColor() {
   if (deskColorName == "amber") return C_AMBER;
   if (deskColorName == "blue") return C_BLUE;
   if (deskColorName == "white") return C_WHITE;
+  if (deskColorName == "claude") return C_CLAUDE;
   return C_GREEN;
+}
+
+static int textWidth(const String &s, uint8_t size) {
+  return (int)s.length() * 6 * size;
+}
+
+static void printCentered(int y, uint8_t size, const String &s,
+                          uint16_t fg, uint16_t bg) {
+  gfx->setTextSize(size);
+  gfx->setTextColor(fg, bg);
+  gfx->setCursor((240 - textWidth(s, size)) / 2, y);
+  gfx->print(s);
+}
+
+static String pctText(int pct) {
+  return (pct < 0) ? String("--") : String(pct) + "%";
+}
+
+static void drawProgressBar(int x, int y, int w, int h, int pct) {
+  gfx->fillRect(x, y, w, h, C_BLACK);
+  gfx->drawRect(x, y, w, h, C_LINE);
+  if (pct > 0) {
+    int p = pct > 100 ? 100 : pct;
+    gfx->fillRect(x + 2, y + 2, (w - 4) * p / 100, h - 4, barColor(pct));
+  }
+}
+
+static void drawClaudeBar(int x, int y, int w, int h, int pct) {
+  gfx->fillRect(x, y, w, h, C_BLACK);
+  gfx->drawRect(x, y, w, h, C_LINE);
+  if (pct > 0) {
+    int p = pct > 100 ? 100 : pct;
+    uint16_t c = pct >= 60 ? barColor(pct) : C_CLAUDE;
+    gfx->fillRect(x + 2, y + 2, (w - 4) * p / 100, h - 4, c);
+  }
+}
+
+static void drawClaudeIcon(int cx, int cy, uint16_t c) {
+  gfx->drawLine(cx - 7, cy, cx + 7, cy, c);
+  gfx->drawLine(cx, cy - 7, cx, cy + 7, c);
+  gfx->drawLine(cx - 5, cy - 5, cx + 5, cy + 5, c);
+  gfx->drawLine(cx - 5, cy + 5, cx + 5, cy - 5, c);
+  gfx->fillCircle(cx, cy, 2, c);
 }
 
 static void drawOtaStatus(const String &line) {
   gfx->fillScreen(C_BLACK);
+  gfx->fillRect(0, 0, 240, 34, C_BLUE);
+  gfx->setTextColor(C_BLACK, C_BLUE);
+  gfx->setTextSize(2);
+  gfx->setCursor(14, 10);
+  gfx->print("OTA UPDATE");
+
   gfx->setTextColor(C_WHITE, C_BLACK);
   gfx->setTextSize(2);
-  gfx->setCursor(16, 76);
-  gfx->print("OTA update");
+  gfx->setCursor(16, 84);
+  gfx->print("firmware");
   gfx->setTextColor(C_GRAY, C_BLACK);
   gfx->setTextSize(1);
-  gfx->setCursor(16, 112);
+  gfx->setCursor(16, 116);
   gfx->print(line);
-  gfx->setCursor(16, 132);
-  gfx->print(WiFi.localIP());
+  String ip = "IP " + WiFi.localIP().toString();
+  gfx->setCursor(236 - textWidth(ip, 1), 230);
+  gfx->print(ip);
 }
 
 static String pad2(int v) {
@@ -709,64 +769,20 @@ static void printRight(int rightX, int y, uint8_t size, const String &s,
   gfx->print(s);
 }
 
-// One usage block (session or weekly). y is the block's top edge.
-static void drawBlock(int y, const char *label, int pct,
-                      unsigned long reset, bool binding, bool isSession) {
-  if (binding) gfx->fillRect(0, y + 2, 4, 80, C_AMBER);
+// Compact IP readout tucked into the bottom-right corner (size-1 gray text).
+// Callers fillScreen(C_BLACK) before this, so no background fill is needed.
+static void drawIpPanel() {
+  printRight(236, 230, 1, "IP " + WiFi.localIP().toString(), C_GRAY, C_BLACK);
+}
 
-  gfx->setTextSize(2);
-  gfx->setTextColor(C_WHITE, C_BLACK);
-  gfx->setCursor(12, y + 6);
-  gfx->print(label);
-  printRight(236, y + 6, 2, (pct < 0) ? "--" : String(pct) + "%", C_WHITE, C_BLACK);
-
-  const int bx = 12, by = y + 30, bw = 216, bh = 18;
-  gfx->fillRect(bx, by, bw, bh, C_BLACK);
-  gfx->drawRect(bx, by, bw, bh, C_LINE);
-  if (pct > 0) {
-    int p = pct > 100 ? 100 : pct;
-    gfx->fillRect(bx + 2, by + 2, (bw - 4) * p / 100, bh - 4, barColor(pct));
-  }
-
+static void drawMetricRow(int y, const char *label, int pct, int barX, int barW) {
   gfx->setTextSize(1);
   gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor(12, y + 54);
-  if (reset == 0) gfx->print("Reset --:--");
-  else if (isSession) gfx->print("Reset " + hhmm(reset + TZ_OFFSET));
-  else gfx->print("Reset " + dowName(reset + TZ_OFFSET) + " " + hhmm(reset + TZ_OFFSET));
-
-  if (isSession) {
-    String cd = (reset && nowEpoch()) ? countdown((long)reset - (long)nowEpoch()) : "T--";
-    printRight(236, y + 54, 1, cd, C_WHITE, C_BLACK);
-  }
-}
-
-static void drawIpPanel() {
-  gfx->fillRect(0, 201, 240, 39, C_PANEL);
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_GRAY, C_PANEL);
-  gfx->setCursor(12, 214);
-  gfx->print("IP");
-  gfx->setTextSize(2);
-  gfx->setTextColor(C_WHITE, C_PANEL);
-  gfx->setCursor(36, 210);
-  gfx->print(WiFi.localIP());
-}
-
-static void drawMacBlock(int y, const char *label, int pct) {
-  gfx->setTextSize(2);
-  gfx->setTextColor(C_WHITE, C_BLACK);
-  gfx->setCursor(12, y + 4);
+  gfx->setCursor(12, y);
   gfx->print(label);
-  printRight(228, y + 4, 2, (pct < 0) ? "--" : String(pct) + "%", C_WHITE, C_BLACK);
-
-  const int bx = 12, by = y + 28, bw = 216, bh = 14;
-  gfx->fillRect(bx, by, bw, bh, C_BLACK);
-  gfx->drawRect(bx, by, bw, bh, C_LINE);
-  if (pct > 0) {
-    int p = pct > 100 ? 100 : pct;
-    gfx->fillRect(bx + 2, by + 2, (bw - 4) * p / 100, bh - 4, barColor(pct));
-  }
+  gfx->setTextColor(C_WHITE, C_BLACK);
+  printRight(226, y, 1, pctText(pct), C_WHITE, C_BLACK);
+  drawProgressBar(barX, y + 13, barW, 12, pct);
 }
 
 // Calendar date from a (TZ-adjusted) epoch — Howard Hinnant's civil_from_days.
@@ -813,12 +829,54 @@ static void drawWaitingTime() {
 
 static void drawWaiting() {
   drawWaitingTime();
-  gfx->drawFastHLine(30, 124, 180, C_LINE);
+  gfx->drawFastHLine(36, 124, 168, C_LINE);
+  printCentered(140, 2, String("waiting for data"), C_WHITE, C_BLACK);
+  printCentered(174, 1, String("G4PYS"), C_GRAY, C_BLACK);
+  drawIpPanel();
+}
+
+static void drawClaudeHero() {
+  uint16_t c = sessionPct >= 60 ? barColor(sessionPct) : C_CLAUDE;
+  if (bindingLimit == 1) gfx->fillRect(0, 38, 5, 104, C_AMBER);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_GRAY, C_BLACK);
+  gfx->setCursor(12, 40);
+  gfx->print("SESSION 5h");
+
+  String pct = pctText(sessionPct);
+  gfx->setTextSize(5);
+  gfx->setTextColor(c, C_BLACK);
+  gfx->setCursor((240 - textWidth(pct, 5)) / 2, 57);
+  gfx->print(pct);
+
+  drawClaudeBar(16, 112, 208, 18, sessionPct);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_GRAY, C_BLACK);
+  gfx->setCursor(12, 138);
+  if (sessReset == 0) gfx->print("reset --:--");
+  else gfx->print("reset " + hhmm(sessReset + TZ_OFFSET));
+
+  String cd = (sessReset && nowEpoch()) ? countdown((long)sessReset - (long)nowEpoch()) : "T--";
+  printRight(228, 138, 1, cd, C_WHITE, C_BLACK);
+}
+
+static void drawClaudeWeekly() {
+  if (bindingLimit == 2) gfx->fillRect(0, 161, 5, 36, C_AMBER);
+
   gfx->setTextSize(2);
   gfx->setTextColor(C_WHITE, C_BLACK);
-  gfx->setCursor(12, 140);
-  gfx->print("waiting for daemon");
-  drawIpPanel();
+  gfx->setCursor(12, 160);
+  gfx->print("WEEKLY");
+  printRight(228, 160, 2, pctText(weeklyPct), C_WHITE, C_BLACK);
+  drawClaudeBar(16, 184, 208, 12, weeklyPct);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_GRAY, C_BLACK);
+  gfx->setCursor(12, 204);
+  if (weekReset == 0) gfx->print("reset --");
+  else gfx->print("reset " + dowName(weekReset + TZ_OFFSET) + " " + hhmm(weekReset + TZ_OFFSET));
 }
 
 // Redraw only the once-per-second fields (clock + session countdown) so the
@@ -828,17 +886,17 @@ void tickDynamic() {
   if (e == 0) return;
 
   if (lcdScreen == SCREEN_DESK) {
-    gfx->fillRect(132, 178, 96, 10, C_BLACK);
-    printRight(228, 178, 1, hhmmss(e + TZ_OFFSET) + " " TZ_LABEL, C_WHITE, C_BLACK);
+    gfx->fillRect(0, 176, 240, 10, C_BLACK);
+    printCentered(176, 1, hhmmss(e + TZ_OFFSET) + " " TZ_LABEL, C_WHITE, C_BLACK);
     return;
   }
 
-  gfx->fillRect(150, 8, 86, 10, C_BLACK);
+  gfx->fillRect(150, 9, 86, 10, C_BLACK);
   printRight(236, 9, 1, hhmmss(e + TZ_OFFSET) + " " TZ_LABEL, C_WHITE, C_BLACK);
 
   if (lcdScreen == SCREEN_CLAUDE && sessReset) {
-    gfx->fillRect(150, 82, 86, 10, C_BLACK);
-    printRight(236, 82, 1, countdown((long)sessReset - (long)e), C_WHITE, C_BLACK);
+    gfx->fillRect(154, 138, 74, 10, C_BLACK);
+    printRight(228, 138, 1, countdown((long)sessReset - (long)e), C_WHITE, C_BLACK);
   }
 }
 
@@ -848,16 +906,25 @@ void drawMacMeter() {
   gfx->setTextSize(1);
   gfx->setTextColor(C_WHITE, C_BLACK);
   gfx->setCursor(4, 9);
-  gfx->print("MAC MONITOR");
+  gfx->print("MAC");
   unsigned long e = nowEpoch();
   printRight(236, 9, 1, e ? hhmmss(e + TZ_OFFSET) + " " TZ_LABEL
                           : String("--:--:-- " TZ_LABEL), C_WHITE, C_BLACK);
-  gfx->drawFastHLine(0, 27, 240, C_LINE);
+  gfx->drawFastHLine(0, 29, 240, C_LINE);
 
-  drawMacBlock(34, "CPU", macCpuPct);
-  drawMacBlock(78, "MEM", macMemPct);
-  drawMacBlock(122, "DISK", macDiskPct);
-  drawMacBlock(166, "BATT", macBatteryPct);
+  drawMetricRow(44, "CPU", macCpuPct, 72, 152);
+  drawMetricRow(82, "MEM", macMemPct, 72, 152);
+  drawMetricRow(120, "DISK", macDiskPct, 72, 152);
+
+  gfx->drawFastHLine(20, 158, 200, C_LINE);
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_GRAY, C_BLACK);
+  gfx->setCursor(12, 176);
+  gfx->print("BATTERY");
+  uint16_t bc = macBatteryPct < 0 ? C_GRAY : barColor(100 - macBatteryPct);
+  gfx->setTextSize(3);
+  gfx->setTextColor(bc, C_BLACK);
+  printRight(226, 166, 3, pctText(macBatteryPct), bc, C_BLACK);
   drawIpPanel();
 }
 
@@ -872,24 +939,21 @@ void drawDeskSign() {
   gfx->setTextSize(2);
   gfx->setTextColor(C_BLACK, c);
   gfx->setCursor(14, 10);
-  gfx->print("DESK STATUS");
+  gfx->print("DESK");
 
   uint8_t textSize = (label.length() <= 8) ? 4 : 3;
   gfx->setTextSize(textSize);
   gfx->setTextColor(c, C_BLACK);
-  int textW = label.length() * 6 * textSize;
+  int textW = textWidth(label, textSize);
   gfx->setCursor((240 - textW) / 2, 88);
   gfx->print(label);
 
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_GRAY, C_BLACK);
-  String hint = "set from dashboard";
-  gfx->setCursor((240 - (int)hint.length() * 6) / 2, 146);
-  gfx->print(hint);
+  gfx->drawFastHLine(42, 148, 156, C_LINE);
 
   unsigned long e = nowEpoch();
-  printRight(228, 178, 1, e ? hhmmss(e + TZ_OFFSET) + " " TZ_LABEL
-                            : String("--:--:-- " TZ_LABEL), C_WHITE, C_BLACK);
+  printCentered(176, 1, e ? hhmmss(e + TZ_OFFSET) + " " TZ_LABEL
+                          : String("--:--:-- " TZ_LABEL), C_WHITE, C_BLACK);
+  printCentered(205, 1, String("G4PYS"), C_GRAY, C_BLACK);
   drawIpPanel();
 }
 
@@ -901,31 +965,29 @@ void drawMeter() {
 
   if (sessionPct < 0 && weeklyPct < 0) { drawWaiting(); return; }
 
-  // Status band: "CLAUDE USAGE" title + status dot/word + Thailand-time clock.
+  // Status band: Claude spark icon + title + API state + Thailand-time clock.
+  drawClaudeIcon(10, 13, C_CLAUDE);
   gfx->setTextSize(1);
-  gfx->setTextColor(C_WHITE, C_BLACK);
-  gfx->setCursor(4, 9);
-  gfx->print("CLAUDE USAGE");
+  gfx->setTextColor(C_CLAUDE, C_BLACK);
+  gfx->setCursor(24, 9);
+  gfx->print("CLAUDE");
   if (unifiedStatus.length()) {
     uint16_t c = statusColor();
-    gfx->fillCircle(86, 13, 4, c);
+    gfx->fillCircle(72, 13, 4, c);
     String label = unifiedStatus;
     label.toUpperCase();
+    if (label.length() > 10) label = label.substring(0, 10);
     gfx->setTextColor(c, C_BLACK);
-    gfx->setCursor(94, 9);
+    gfx->setCursor(82, 9);
     gfx->print(label);
   }
   unsigned long e = nowEpoch();
   printRight(236, 9, 1, e ? hhmmss(e + TZ_OFFSET) + " " TZ_LABEL
                           : String("--:--:-- " TZ_LABEL), C_WHITE, C_BLACK);
-  gfx->drawFastHLine(0, 27, 240, C_LINE);
+  gfx->drawFastHLine(0, 29, 240, C_CLAUDE);
 
-  drawBlock(28, "SESSION 5h", sessionPct, sessReset, bindingLimit == 1, true);
-  gfx->drawFastHLine(0, 113, 240, C_LINE);
-  drawBlock(114, "WEEKLY 7d", weeklyPct, weekReset, bindingLimit == 2, false);
-  gfx->drawFastHLine(0, 198, 240, C_LINE);   // double rule under weekly
-  gfx->drawFastHLine(0, 200, 240, C_LINE);
-
+  drawClaudeHero();
+  drawClaudeWeekly();
   drawIpPanel();
 }
 
