@@ -129,7 +129,13 @@ To switch the physical LCD directly:
 http://clawdmeter.local/mode?screen=mac
 http://clawdmeter.local/mode?screen=claude
 http://clawdmeter.local/mode?screen=desk
+http://clawdmeter.local/mode?screen=face
 ```
+
+`face` is the animated Claude block-mascot companion: it blinks, glances around,
+shuffles its feet, and changes mood/color from your live usage (HAPPY → FOCUS →
+ALERT, plus a SLEEPY look at night). The dashboard mode button cycles
+Claude → Mac → Desk → Face.
 
 To set brightness directly:
 

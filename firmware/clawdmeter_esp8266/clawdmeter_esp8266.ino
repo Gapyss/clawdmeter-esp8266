@@ -26,6 +26,27 @@ ESP8266WebServer server(80);
 Arduino_DataBus *bus = new Arduino_HWSPI(LCD_DC, GFX_NOT_DEFINED /* CS -> GND */);
 Arduino_GFX *gfx = new Arduino_ST7789(bus, LCD_RST, LCD_ROT, true /* IPS */, 240, 240);
 
+// Companion-face mood descriptor (the "Claude mascot" screen). Defined up here
+// because Arduino auto-generates function prototypes at the top of the file, so a
+// struct used as a parameter/field type must already be visible at that point.
+struct FaceExpr {
+  uint16_t body;     // mascot body color
+  uint16_t spark;    // mood "antenna" spark + status-text color
+  uint8_t  eyeH;     // open-eye height (px)
+  uint8_t  mouth;    // 0 smile, 1 flat, 2 open, 3 sleepy
+  uint8_t  id;       // mood id, for cheap change detection
+  const char *mood;  // status label
+};
+
+// Face-animation frame types. Also defined up here (same auto-prototype reason as
+// FaceExpr): the scene-selector helpers return/take these, so they must be visible
+// where Arduino injects their prototypes at the top of the file.
+// A sparse cell patch {row, col, value} applied on top of the (shifted) base.
+struct FacePatch { uint8_t r, c, v; };
+// One animation step: hold (ms), base shift (dr,dc), and an optional cell patch.
+struct FaceFrame { uint16_t hold; int8_t dr, dc; const FacePatch *ops; uint8_t nops; };
+#define FACE_PATCH(a) (a), (uint8_t)(sizeof(a) / sizeof((a)[0]))
+
 static const uint8_t EEPROM_MARKER_ADDR = 0;
 static const uint8_t EEPROM_BRIGHTNESS_ADDR = 1;
 static const uint8_t EEPROM_MARKER = 0xC1;
@@ -95,7 +116,9 @@ int macBatteryPct = -1;         // Mac battery level, -1 if unavailable
 static const uint8_t SCREEN_CLAUDE = 0;
 static const uint8_t SCREEN_MAC = 1;
 static const uint8_t SCREEN_DESK = 2;
+static const uint8_t SCREEN_FACE = 3;
 uint8_t lcdScreen = SCREEN_CLAUDE;
+bool faceWorking = false;       // face mode sub-state: false=idle, true=desk-coding
 String deskStatus = "coding";   // coding / busy / break
 String deskText = "CODING";
 String deskColorName = "green";
@@ -188,6 +211,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <section class="panel">
   <div class="label"><span class="name">Device</span><span class="muted" id="mode">waiting</span></div>
   <div class="actions"><a class="btn" href="/usage.json">Usage JSON</a><a class="btn" href="/update">OTA Update</a><a class="btn" href="/restart" id="restartDevice">Restart</a><a class="btn danger" href="/factory-reset" id="factoryReset">Reset Settings</a></div>
+  <div class="control"><span class="muted">Companion</span><div class="actions"><button class="btn faceBtn" data-state="idle">Idle</button><button class="btn faceBtn" data-state="working">Working</button></div><span class="v" id="faceValue">--</span></div>
   <div class="control"><span class="muted">Desk</span><div class="actions"><button class="btn deskBtn" data-status="coding">Coding</button><button class="btn deskBtn" data-status="claude">Claude</button><button class="btn deskBtn" data-status="busy">Busy</button><button class="btn deskBtn" data-status="break">Break</button></div><span class="v" id="deskValue">--</span></div>
   <div class="control"><span class="muted">Custom</span><div class="deskCustom"><input id="deskText" type="text" maxlength="12" value="CODING"><select id="deskColor"><option value="green">Green</option><option value="claude">Claude</option><option value="red">Red</option><option value="amber">Amber</option><option value="blue">Blue</option><option value="white">White</option></select><button class="btn" id="deskApply">Apply</button></div><span></span></div>
   <div class="control"><span class="muted">Brightness</span><input id="brightness" type="range" min="0" max="120" value="90"><span class="v" id="brightnessValue">90</span></div>
@@ -218,6 +242,7 @@ function storedView(){
   var q=location.search;
   if(q.indexOf('view=mac')>=0)return 'mac';
   if(q.indexOf('view=desk')>=0)return 'desk';
+  if(q.indexOf('view=face')>=0)return 'face';
   if(q.indexOf('view=claude')>=0)return 'claude';
   try{return localStorage.getItem('view')||'claude';}catch(e){return 'claude';}
 }
@@ -230,7 +255,7 @@ function saveView(v){
 }
 document.getElementById('switchMode').onclick=function(e){
   if(e&&e.preventDefault)e.preventDefault();
-  view=view=='claude'?'mac':view=='mac'?'desk':'claude';
+  view=view=='claude'?'mac':view=='mac'?'desk':view=='desk'?'face':'claude';
   saveView(view);
   tick();
 };
@@ -243,6 +268,22 @@ function setDeskCustomUi(text,color){
   var active=document.activeElement&&document.activeElement.id;
   if(text&&active!='deskText')document.getElementById('deskText').value=text;
   if(color&&active!='deskColor')document.getElementById('deskColor').value=color;
+}
+function setFaceUi(state){
+  document.getElementById('faceValue').textContent=state?state.toUpperCase():'--';
+  var bs=document.querySelectorAll('.faceBtn');
+  for(var i=0;i<bs.length;i++)bs[i].className='btn faceBtn'+(bs[i].getAttribute('data-state')==state?' active':'');
+}
+var faceBtns=document.querySelectorAll('.faceBtn');
+for(var fi=0;fi<faceBtns.length;fi++){
+  faceBtns[fi].onclick=function(e){
+    if(e&&e.preventDefault)e.preventDefault();
+    var s=this.getAttribute('data-state');
+    setFaceUi(s);
+    view='face';
+    saveView(view);
+    fetch('/face?state='+s,{cache:'no-store',method:'POST'}).then(tick).catch(function(e){});
+  };
 }
 var deskBtns=document.querySelectorAll('.deskBtn');
 for(var di=0;di<deskBtns.length;di++){
@@ -295,6 +336,7 @@ async function tick(){
     if(!brightnessBusy&&d.bl>=0)setBrightnessUi(d.bl);
     setDeskUi(d.desk||'coding');
     setDeskCustomUi(d.deskText||'CODING',d.deskColor||'green');
+    setFaceUi(d.face||'idle');
     var now=d.now||0;
     document.getElementById('clock').textContent=now?utcClock(now):'--:--:--';
     document.getElementById('age').textContent=ageText(d.age);
@@ -303,8 +345,8 @@ async function tick(){
     if(view=='desk'){
       document.getElementById('title').textContent='Desk Status';
       document.getElementById('subtitle').textContent='Physical status sign';
-      document.getElementById('switchMode').textContent='Claude';
-      document.getElementById('switchMode').href='?view=claude';
+      document.getElementById('switchMode').textContent='Face';
+      document.getElementById('switchMode').href='?view=face';
       document.getElementById('sessionName').textContent='Current status';
       document.getElementById('weeklyName').textContent='Screen mode';
       document.getElementById('sessionCard').className='panel meter';
@@ -344,6 +386,28 @@ async function tick(){
       st.textContent='MAC - updated '+ageText(d.age)+' ago';
       dot.style.background=live?'var(--green)':'var(--yellow)';
       document.getElementById('mode').textContent='mac system metrics';
+    }else if(view=='face'){
+      document.getElementById('title').textContent='Companion';
+      document.getElementById('subtitle').textContent=d.face=='working'?'Coding at the desk':'Claude mascot on the cube';
+      document.getElementById('switchMode').textContent='Claude';
+      document.getElementById('switchMode').href='?view=claude';
+      document.getElementById('sessionName').textContent='Session window';
+      document.getElementById('weeklyName').textContent='Weekly window';
+      document.getElementById('sessionCard').className='panel meter';
+      document.getElementById('weeklyCard').className='panel meter';
+      set('sp','sf',d.s); set('wp','wf',d.w);
+      document.getElementById('stok').textContent=commas(d.st);
+      document.getElementById('wtok').textContent=commas(d.wt);
+      document.getElementById('stat3Name').textContent='Session tokens';
+      document.getElementById('stat4Name').textContent='Weekly tokens';
+      document.getElementById('st').textContent='Mood from usage';
+      document.getElementById('sc').textContent='';
+      document.getElementById('wt').textContent='Live on the LCD';
+      document.getElementById('wc').textContent='';
+      var mood=d.face=='working'?'CODING':(d.s>=80||d.w>=90||(d.stat&&d.stat!='allowed')?'ALERT':d.s>=40?'FOCUS':'HAPPY');
+      st.textContent='COMPANION - '+mood;
+      dot.style.background=mood=='ALERT'?'var(--red)':mood=='FOCUS'?'var(--yellow)':'var(--claude)';
+      document.getElementById('mode').textContent='companion face';
     }else{
       document.getElementById('title').textContent='Clawdmeter';
       document.getElementById('subtitle').textContent='Claude usage monitor';
@@ -463,6 +527,7 @@ void handleUsage() {
 static String screenName() {
   if (lcdScreen == SCREEN_DESK) return "desk";
   if (lcdScreen == SCREEN_MAC) return "mac";
+  if (lcdScreen == SCREEN_FACE) return "face";
   return "claude";
 }
 
@@ -481,6 +546,7 @@ void handleUsageJson() {
              ",\"disk\":" + String(macDiskPct) +
              ",\"bat\":" + String(macBatteryPct) +
              ",\"screen\":\"" + screenName() + "\"" +
+             ",\"face\":\"" + String(faceWorking ? "working" : "idle") + "\"" +
              ",\"desk\":\"" + deskStatus + "\"" +
              ",\"deskText\":\"" + deskText + "\"" +
              ",\"deskColor\":\"" + deskColorName + "\"" +
@@ -519,6 +585,7 @@ void handleMode() {
     uint8_t nextScreen = lcdScreen;
     if (screen == "mac") nextScreen = SCREEN_MAC;
     else if (screen == "desk") nextScreen = SCREEN_DESK;
+    else if (screen == "face") nextScreen = SCREEN_FACE;
     else if (screen == "claude") nextScreen = SCREEN_CLAUDE;
     if (nextScreen != lcdScreen) {
       lcdScreen = nextScreen;
@@ -641,6 +708,7 @@ void handleFactoryReset() {
 #define C_BLUE   0x041F
 #define C_AMBER  0xFD20
 #define C_CLAUDE 0xDBAA   // warm Claude-style orange accent (#D97757-ish)
+#define C_CLAY   0xCBED   // muted clay (#CD7F6A) — the pixel-creature body color
 
 // Display clock/reset times in Thailand time. Pushed epochs are UTC; add the
 // offset only when formatting wall-clock text (durations/countdowns stay raw).
@@ -957,9 +1025,384 @@ void drawDeskSign() {
   drawIpPanel();
 }
 
+// ---- Companion face: the Claude "pixel creature", animated frame by frame ------
+// A 20x20 pixel-grid mascot, ported from the PixelEngine reference (its idle
+// look-around preset). Each grid cell is one 12px square on the 240x240 panel
+// (240 / 20 = 12). Cell values: 0 empty, 1 body (mood color), 2 eye (drawn as a
+// dark hole punched in the body). A frame is the base creature optionally shifted
+// by (dr,dc) and patched with a few cells; the preset plays the frames on a
+// per-frame hold timer. Eyes lead, the head follows (glance left, right, up).
+// Driven by the millis() poll in loop() (NOT a timer ISR), so it costs zero IRAM
+// and never fights WiFi/TCP; only the cells that change between frames repaint.
+#define F_N    20          // grid is 20x20
+// Cell palette. 0..2 are the idle creature (empty / mood body / eye-hole). 3..9
+// are the extra colors the "working" desk scene needs (headphones, laptop, desk).
+// faceCellColor() maps each to a panel color; value 1 (body) tracks the mood.
+static const uint8_t CELL_EMPTY = 0, CELL_BODY = 1, CELL_EYE = 2,
+                     CELL_HP_LIGHT = 3, CELL_HP_SHADOW = 4, CELL_SCREEN = 5,
+                     CELL_LBASE = 6, CELL_LOGO = 7, CELL_DESKTOP = 8,
+                     CELL_DESKLEG = 9;
+// RGB565 for the desk-scene cells (converted from the reference #hex palette).
+#define C_HP_LIGHT  0xD6FC   // headphone light  #d4dde2
+#define C_HP_SHADOW 0x8C93   // headphone shadow #8a9199
+#define C_SCREEN    0x6B8F   // laptop screen    #6e7278
+#define C_LBASE     0x39E8   // laptop base      #3a3c40
+#define C_LOGO      0xBDF8   // laptop logo/cursor #b8bcc0
+#define C_DESKTOP   0x2966   // desk top         #2a2c30
+#define C_DESKLEG   0x18E4   // desk leg         #1c1e21
+
+// On-screen placement. The creature is drawn in a CENTERED zone (not the whole
+// panel) so a header strip, a divider rule and a footer data bar fit around it.
+// Only the window rows FACE_R0..FACE_R1 / cols FACE_C0..FACE_C1 are ever painted
+// — that is every cell the look-around animation can reach (head-up shifts to
+// row 3, eye/head glances reach cols 2 and 18) — which keeps creature pixels out
+// of the header/footer chrome on a force repaint. Origin places content col 10 /
+// row 10 at panel centre (120) within the zone; 10px cells (vs the old 12) free
+// the top/bottom bands for chrome.
+#define FACE_CELL 10
+#define FACE_OX   15       // x = FACE_OX + col*FACE_CELL  (content col 3..17 -> x45..195)
+#define FACE_OY   4        // y = FACE_OY + row*FACE_CELL  (content row 4..16 -> y44..174)
+#define FACE_R0   3
+#define FACE_R1   17
+#define FACE_C0   2
+#define FACE_C1   18
+
+// Base creature (the reference "idle" grid). PROGMEM -> lives in flash, not RAM.
+static const uint8_t creatureBase[F_N][F_N] PROGMEM = {
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0},
+  {0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0},
+  {0,0,0,0,0,1,1,2,1,1,1,1,1,2,1,1,0,0,0,0},
+  {0,0,0,1,1,1,1,2,1,1,1,1,1,2,1,1,1,1,0,0},
+  {0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0},
+  {0,0,0,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0,0},
+  {0,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1,0,1,0,0},
+  {0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0},
+  {0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0},
+  {0,0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,0,0,0,0},
+  {0,0,0,0,0,1,0,0,1,0,0,0,1,0,0,1,0,0,0,0},
+  {0,0,0,0,0,1,0,0,1,0,0,0,1,0,0,1,0,0,0,0},
+  {0,0,0,0,0,1,0,0,1,0,0,0,1,0,0,1,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+};
+
+// Eye-move and head-follow patches (head-follow shifts the eyes one further in the
+// same direction). Mirrors the reference's patch()/shift() frame builders exactly.
+static const FacePatch P_EYES_L[] = {
+  {6,7,CELL_BODY},{7,7,CELL_BODY},{6,13,CELL_BODY},{7,13,CELL_BODY},
+  {6,6,CELL_EYE}, {7,6,CELL_EYE}, {6,12,CELL_EYE}, {7,12,CELL_EYE},
+};
+static const FacePatch P_HEAD_L[] = {
+  {6,6,CELL_BODY},{7,6,CELL_BODY},{6,12,CELL_BODY},{7,12,CELL_BODY},
+  {6,5,CELL_EYE}, {7,5,CELL_EYE}, {6,11,CELL_EYE}, {7,11,CELL_EYE},
+};
+static const FacePatch P_EYES_R[] = {
+  {6,7,CELL_BODY},{7,7,CELL_BODY},{6,13,CELL_BODY},{7,13,CELL_BODY},
+  {6,8,CELL_EYE}, {7,8,CELL_EYE}, {6,14,CELL_EYE}, {7,14,CELL_EYE},
+};
+static const FacePatch P_HEAD_R[] = {
+  {6,8,CELL_BODY},{7,8,CELL_BODY},{6,14,CELL_BODY},{7,14,CELL_BODY},
+  {6,9,CELL_EYE}, {7,9,CELL_EYE}, {6,15,CELL_EYE}, {7,15,CELL_EYE},
+};
+static const FacePatch P_EYES_UP[] = {
+  {6,7,CELL_BODY},{7,7,CELL_BODY},{6,13,CELL_BODY},{7,13,CELL_BODY},
+  {5,7,CELL_EYE}, {5,13,CELL_EYE},
+};
+static const FacePatch P_HEAD_UP[] = {
+  {5,7,CELL_BODY},{6,7,CELL_BODY},{5,13,CELL_BODY},{6,13,CELL_BODY},
+  {4,7,CELL_EYE}, {4,13,CELL_EYE},
+};
+static const FacePatch P_CURIOUS[] = { {5,6,CELL_BODY},{5,14,CELL_BODY} };
+
+// The "idle look around" preset (values copied verbatim from the reference).
+static const FaceFrame FACE_FRAMES[] = {
+  {800,  0,  0, nullptr, 0},
+  {200,  0,  0, FACE_PATCH(P_EYES_L)},   // glance left: eyes first...
+  {500,  0, -1, FACE_PATCH(P_HEAD_L)},   // ...then head follows
+  {300,  0,  0, FACE_PATCH(P_EYES_L)},
+  {200,  0,  0, nullptr, 0},
+  {400,  0,  0, FACE_PATCH(P_CURIOUS)},  // brief curious rest
+  {400,  0,  0, nullptr, 0},
+  {200,  0,  0, FACE_PATCH(P_EYES_R)},   // glance right
+  {500,  0,  1, FACE_PATCH(P_HEAD_R)},
+  {300,  0,  0, FACE_PATCH(P_EYES_R)},
+  {200,  0,  0, nullptr, 0},
+  {500,  0,  0, nullptr, 0},
+  {200,  0,  0, FACE_PATCH(P_EYES_UP)},  // look up
+  {400, -1,  0, FACE_PATCH(P_HEAD_UP)},
+  {300,  0,  0, FACE_PATCH(P_EYES_UP)},
+  {200,  0,  0, nullptr, 0},
+  {700,  0,  0, nullptr, 0},             // settle
+};
+static const uint8_t FACE_NFRAMES = sizeof(FACE_FRAMES) / sizeof(FACE_FRAMES[0]);
+
+// ---- "Working" scene: the same mascot, headphones on, coding at a desk --------
+// A second base grid (the user's "work_coding" pixel art, compacted to the face
+// animation window rows 3..16 / cols 2..17). Cells: body/eye as before, plus the
+// headphone (HP_*), laptop (SCREEN/LBASE/LOGO) and desk (DESKTOP/DESKLEG) colors.
+// Its frames are pure cell patches with NO base shift (dr=dc=0) so the desk stays
+// put while only the hands / eyes / on-screen cursor move.
+#define DB CELL_BODY
+#define DE CELL_EYE
+#define DH CELL_HP_LIGHT
+#define DS CELL_HP_SHADOW
+#define DC CELL_SCREEN
+#define DL CELL_LBASE
+#define DG CELL_LOGO
+#define DT CELL_DESKTOP
+#define DK CELL_DESKLEG
+#define __ CELL_EMPTY
+static const uint8_t deskBase[F_N][F_N] PROGMEM = {
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, // 0
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, // 1
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, // 2
+  {__,__,__,__,__,__,__,DH,DH,DH,DH,DH,DH,__,__,__,__,__,__,__}, // 3 headband
+  {__,__,__,__,__,DH,DS,DB,DB,DB,DB,DB,DB,DS,DH,__,__,__,__,__}, // 4 cups + head
+  {__,__,__,__,__,DH,DS,DB,DE,DB,DB,DE,DB,DS,DH,__,__,__,__,__}, // 5 cups + eyes
+  {__,__,__,__,__,DH,DS,DB,DB,DB,DB,DB,DB,DS,DH,__,__,__,__,__}, // 6 cups + head
+  {__,__,__,__,__,__,__,DB,DB,DB,DB,DB,DB,__,__,__,__,__,__,__}, // 7 chin
+  {__,__,__,__,__,DB,DB,DB,DB,DB,DB,DB,DB,DB,DB,__,__,__,__,__}, // 8 shoulders
+  {__,__,__,__,DB,DB,DC,DC,DC,DC,DC,DC,DC,DC,DB,DB,__,__,__,__}, // 9 arms + screen
+  {__,__,__,__,DB,DB,DC,DC,DC,DG,DG,DC,DC,DC,DB,DB,__,__,__,__}, //10 arms + logo
+  {__,__,__,__,DB,DB,DC,DC,DC,DC,DC,DC,DC,DC,DB,DB,__,__,__,__}, //11 arms + screen
+  {__,__,__,__,__,DL,DL,DL,DL,DL,DL,DL,DL,DL,DL,__,__,__,__,__}, //12 laptop base
+  {__,__,DT,DT,DT,DT,DT,DT,DT,DT,DT,DT,DT,DT,DT,DT,DT,DT,__,__}, //13 desk top
+  {__,__,__,DK,DK,__,__,__,__,__,__,__,__,__,__,DK,DK,__,__,__}, //14 desk legs
+  {__,__,__,DK,DK,__,__,__,__,__,__,__,__,__,__,DK,DK,__,__,__}, //15 desk legs
+  {__,__,__,DK,DK,__,__,__,__,__,__,__,__,__,__,DK,DK,__,__,__}, //16 desk legs
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, //17
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, //18
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, //19
+};
+#undef DB
+#undef DE
+#undef DH
+#undef DS
+#undef DC
+#undef DL
+#undef DG
+#undef DT
+#undef DK
+#undef __
+
+// Working-scene patches (applied with no base shift). Hands drop onto the laptop
+// base to "type"; eyes blink/look up; a cursor blinks on the screen while thinking.
+static const FacePatch W_TYPE_L[]   = { {12,6,CELL_BODY} };
+static const FacePatch W_TYPE_R[]   = { {12,13,CELL_BODY} };
+static const FacePatch W_TYPE_BOTH[]= { {12,6,CELL_BODY},{12,13,CELL_BODY} };
+static const FacePatch W_BLINK[]    = { {5,8,CELL_BODY},{5,11,CELL_BODY} };
+static const FacePatch W_THINK[]    = { {5,8,CELL_BODY},{5,11,CELL_BODY},
+                                        {4,8,CELL_EYE}, {4,11,CELL_EYE} };
+static const FacePatch W_THINK_CUR[]= { {5,8,CELL_BODY},{5,11,CELL_BODY},
+                                        {4,8,CELL_EYE}, {4,11,CELL_EYE},
+                                        {11,12,CELL_LOGO} };
+static const FaceFrame WORK_FRAMES[] = {
+  {220, 0, 0, FACE_PATCH(W_TYPE_L)},
+  {220, 0, 0, FACE_PATCH(W_TYPE_R)},
+  {180, 0, 0, FACE_PATCH(W_TYPE_BOTH)},
+  {220, 0, 0, FACE_PATCH(W_TYPE_L)},
+  {220, 0, 0, FACE_PATCH(W_TYPE_R)},
+  {110, 0, 0, FACE_PATCH(W_BLINK)},
+  {110, 0, 0, nullptr, 0},
+  {550, 0, 0, FACE_PATCH(W_THINK)},      // pause to think...
+  {350, 0, 0, FACE_PATCH(W_THINK_CUR)},  // ...cursor blinks on the screen
+  {300, 0, 0, FACE_PATCH(W_THINK)},
+  {350, 0, 0, FACE_PATCH(W_THINK_CUR)},
+  {220, 0, 0, FACE_PATCH(W_TYPE_L)},     // back to typing
+  {220, 0, 0, FACE_PATCH(W_TYPE_R)},
+  {180, 0, 0, FACE_PATCH(W_TYPE_BOTH)},
+};
+static const uint8_t WORK_NFRAMES = sizeof(WORK_FRAMES) / sizeof(WORK_FRAMES[0]);
+
+static uint8_t faceGrid[F_N][F_N];   // the frame currently shown
+static uint8_t facePrev[F_N][F_N];   // last grid drawn (for cell diffing)
+static bool faceInit = false;
+static uint8_t faceFrameIdx = 0;
+static unsigned long faceFrameStart = 0;
+static uint16_t faceBody = C_CLAY;   // current body color (tracks mood)
+static uint8_t faceMoodId = 255;
+static unsigned long faceClockSec = 0;
+
+// Pick the active scene (base grid + frame list) by state.
+static const FaceFrame *faceFrameList() { return faceWorking ? WORK_FRAMES : FACE_FRAMES; }
+static uint8_t faceFrameCount() { return faceWorking ? WORK_NFRAMES : FACE_NFRAMES; }
+
+static FaceExpr faceComputeExpr() {
+  FaceExpr e;
+  unsigned long ee = nowEpoch();
+  int hour = ee ? (int)(((ee + TZ_OFFSET) / 3600UL) % 24UL) : 12;
+  bool alarmed = (sessionPct >= 80) || (weeklyPct >= 90) ||
+                 (unifiedStatus.length() && unifiedStatus != "allowed");
+  bool sleepy = (hour >= 23 || hour < 7);
+  // Body + accent are ALWAYS the Claude palette (clay creature, orange spark) —
+  // never percent-tinted green/yellow/red. Only the mood *label* tracks state.
+  if (alarmed) {
+    e.eyeH = 32; e.mouth = 2; e.id = 2; e.mood = "ALERT";
+  } else if (sleepy) {
+    e.eyeH = 14; e.mouth = 3; e.id = 3; e.mood = "SLEEPY";
+  } else if (sessionPct >= 40) {
+    e.eyeH = 24; e.mouth = 1; e.id = 1; e.mood = "FOCUS";
+  } else {
+    e.eyeH = 26; e.mouth = 0; e.id = 0; e.mood = "HAPPY";
+  }
+  e.body = C_CLAY; e.spark = C_CLAUDE;
+  // Working state overrides the mood label (id 10 is distinct so a toggle is seen
+  // as a mood change and forces a status repaint).
+  if (faceWorking) { e.mood = "CODING"; e.id = 10; }
+  return e;
+}
+
+// Map a grid cell to a panel color. Eyes are near-black (#0f0f0f in the ref), so
+// they read as holes punched in the body -> drawing them as C_BLACK is faithful.
+static uint16_t faceCellColor(uint8_t v, uint16_t body) {
+  switch (v) {
+    case CELL_BODY:      return body;        // mood color (clay)
+    case CELL_HP_LIGHT:  return C_HP_LIGHT;
+    case CELL_HP_SHADOW: return C_HP_SHADOW;
+    case CELL_SCREEN:    return C_SCREEN;
+    case CELL_LBASE:     return C_LBASE;
+    case CELL_LOGO:      return C_LOGO;
+    case CELL_DESKTOP:   return C_DESKTOP;
+    case CELL_DESKLEG:   return C_DESKLEG;
+    default:             return C_BLACK;     // empty + eye (holes read as black)
+  }
+}
+
+// Build a frame grid: clear, copy the base shifted by (dr,dc), then apply the
+// sparse cell patch. Cells shifted off-grid are dropped (cleared to empty), which
+// is what makes the head-follow shift leave a clean trailing edge.
+static void faceBuildGrid(uint8_t out[F_N][F_N], const FaceFrame &f,
+                          const uint8_t base[F_N][F_N]) {
+  for (int r = 0; r < F_N; r++)
+    for (int c = 0; c < F_N; c++) out[r][c] = CELL_EMPTY;
+  for (int r = 0; r < F_N; r++) {
+    int nr = r + f.dr;
+    if (nr < 0 || nr >= F_N) continue;
+    for (int c = 0; c < F_N; c++) {
+      int nc = c + f.dc;
+      if (nc < 0 || nc >= F_N) continue;
+      out[nr][nc] = pgm_read_byte(&base[r][c]);
+    }
+  }
+  for (uint8_t i = 0; i < f.nops; i++)
+    out[f.ops[i].r][f.ops[i].c] = f.ops[i].v;
+}
+
+// The base grid for the active scene.
+static const uint8_t (*faceActiveBase())[F_N] {
+  return faceWorking ? deskBase : creatureBase;
+}
+
+// Repaint the grid. force=true redraws every cell (used on a body-color change);
+// otherwise only cells that differ from the last drawn grid are touched, so a
+// frame step paints just the handful of moved eye/edge cells.
+static void faceRender(uint16_t body, bool force) {
+  // Confined to the animation window: this both centres the creature and keeps
+  // its (black) empty cells from painting over the header/footer chrome.
+  for (int r = FACE_R0; r <= FACE_R1; r++) {
+    for (int c = FACE_C0; c <= FACE_C1; c++) {
+      uint8_t v = faceGrid[r][c];
+      if (force || v != facePrev[r][c]) {
+        gfx->fillRect(FACE_OX + c * FACE_CELL, FACE_OY + r * FACE_CELL,
+                      FACE_CELL, FACE_CELL, faceCellColor(v, body));
+        facePrev[r][c] = v;
+      }
+    }
+  }
+}
+
+// Static frame, drawn once per faceBegin: the Claude-orange bezel/safe-area, the
+// header and divider rules, and the small-caps footer sub-labels. The per-second
+// status redraw never touches any of this, so the sub-labels can't be ghosted by
+// the clock tick.
+static void faceDrawChrome() {
+  gfx->drawRoundRect(1, 1, 238, 238, 8, C_CLAUDE);   // bezel / safe area
+  gfx->drawFastHLine(8, 31, 224, C_CLAUDE);          // header rule
+  gfx->drawFastHLine(8, 190, 224, C_CLAUDE);         // creature | data divider
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_CLAUDE, C_BLACK);
+  gfx->setCursor(14, 197); gfx->print("MOOD");
+  printRight(226, 197, 1, "TIME", C_CLAUDE, C_BLACK);
+}
+
+// Dynamic readout. Header: three state dots (session / weekly / server-status
+// health) plus a compact live %-label — distinct from the footer mood so the two
+// zones don't say the same thing. Footer: mood value (left, spark colour) and the
+// clock (right, white), each cleared in its own rectangle so a variable-length
+// mood (SLEEPY=6 vs HAPPY=5) leaves no ghost and the sub-labels survive.
+static void faceDrawStatus(const FaceExpr &e) {
+  int sc = sessionPct, wc = weeklyPct;
+  gfx->fillCircle(16, 18, 4, C_CLAUDE);   // always Claude orange, never percent-tinted
+  gfx->fillCircle(30, 18, 4, C_CLAUDE);
+  gfx->fillCircle(44, 18, 4, C_CLAUDE);
+  String hdr = "S" + pctText(sc) + " W" + pctText(wc);
+  gfx->fillRect(96, 11, 138, 9, C_BLACK);            // clear old label
+  printRight(232, 12, 1, hdr, C_CLAUDE, C_BLACK);
+
+  unsigned long ee = nowEpoch();
+  String clk = ee ? hhmmss(ee + TZ_OFFSET) : String("--:--:--");
+  gfx->fillRect(12, 208, 96, 16, C_BLACK);           // clear old mood value
+  gfx->setTextSize(2);
+  gfx->setTextColor(e.spark, C_BLACK);
+  gfx->setCursor(14, 209); gfx->print(e.mood);
+  gfx->fillRect(130, 208, 104, 16, C_BLACK);         // clear old clock
+  printRight(232, 209, 2, clk, C_WHITE, C_BLACK);
+}
+
+static void faceBegin() {
+  faceInit = true;
+  faceFrameIdx = 0;
+  faceFrameStart = millis();
+  FaceExpr e = faceComputeExpr();
+  faceBody = e.body; faceMoodId = e.id;
+  gfx->fillScreen(C_BLACK);
+  faceDrawChrome();
+  faceBuildGrid(faceGrid, faceFrameList()[0], faceActiveBase());
+  memset(facePrev, 0xFF, sizeof(facePrev));   // sentinel -> first render draws all
+  faceRender(faceBody, true);
+  faceClockSec = 0;
+  faceDrawStatus(e);
+}
+
+// One animation step. Called every loop() iteration; advances the preset on its
+// own per-frame hold timer (the reference frame.hold values), redrawing only the
+// cells that change. No timer ISR, so it never starves WiFi/TCP.
+static void faceTick() {
+  if (!faceInit) { faceBegin(); return; }
+  unsigned long now = millis();
+  unsigned long sec = nowEpoch();
+  FaceExpr e = faceComputeExpr();
+
+  // Mood -> body color. Repaint the *current* frame in the new color (without
+  // resetting the animation), so a usage change recolors the creature in place.
+  if (e.body != faceBody || e.id != faceMoodId) {
+    faceBody = e.body; faceMoodId = e.id;
+    faceRender(faceBody, true);
+    faceDrawStatus(e); faceClockSec = sec;
+  }
+
+  // Advance to the next preset frame once the current one's hold has elapsed.
+  const FaceFrame *frames = faceFrameList();
+  if (now - faceFrameStart >= frames[faceFrameIdx].hold) {
+    faceFrameIdx = (faceFrameIdx + 1) % faceFrameCount();
+    faceFrameStart = now;
+    faceBuildGrid(faceGrid, frames[faceFrameIdx], faceActiveBase());
+    faceRender(faceBody, false);
+  }
+
+  // Tick the clock once a second.
+  if (sec != faceClockSec) { faceClockSec = sec; faceDrawStatus(e); }
+}
+
 void drawMeter() {
   if (lcdScreen == SCREEN_MAC) { drawMacMeter(); return; }
   if (lcdScreen == SCREEN_DESK) { drawDeskSign(); return; }
+  if (lcdScreen == SCREEN_FACE) { faceBegin(); return; }
 
   gfx->fillScreen(C_BLACK);
 
@@ -989,6 +1432,26 @@ void drawMeter() {
   drawClaudeHero();
   drawClaudeWeekly();
   drawIpPanel();
+}
+
+// Toggle the companion between idle (look-around) and working (desk-coding).
+// /face?state=idle|working|toggle . Switches the LCD to face mode if needed and
+// restarts the animation so the new scene draws immediately. Defined after
+// drawMeter()/faceBegin() so it can call them without a forward prototype.
+void handleFace() {
+  if (server.hasArg("state")) {
+    String st = server.arg("state");
+    st.toLowerCase();
+    if (st == "working") faceWorking = true;
+    else if (st == "idle") faceWorking = false;
+    else if (st == "toggle") faceWorking = !faceWorking;
+    lcdScreen = SCREEN_FACE;
+    lastTickEpoch = 0;
+    faceInit = false;        // force a fresh faceBegin() for the new scene
+    drawMeter();
+  }
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", faceWorking ? "working" : "idle");
 }
 
 void handleUpdateDone() {
@@ -1124,6 +1587,8 @@ void setup() {
   server.on("/brightness", HTTP_POST, handleBrightness);
   server.on("/mode", HTTP_GET, handleMode);
   server.on("/mode", HTTP_POST, handleMode);
+  server.on("/face", HTTP_GET, handleFace);
+  server.on("/face", HTTP_POST, handleFace);
   server.on("/desk", HTTP_GET, handleDesk);
   server.on("/desk", HTTP_POST, handleDesk);
   server.on("/restart", HTTP_GET, handleRestart);
@@ -1148,6 +1613,12 @@ void loop() {
   if (meterRedrawPending) {
     meterRedrawPending = false;
     drawMeter();
+  }
+
+  if (lcdScreen == SCREEN_FACE) {
+    faceTick();    // self-paced animation; owns its own clock + redraws
+    delay(2);      // keep the WiFi modem-sleep yield (see note below)
+    return;
   }
 
   unsigned long e = nowEpoch();

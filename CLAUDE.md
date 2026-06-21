@@ -116,7 +116,17 @@ bind = binding limit 1=session/2=weekly, t = server epoch for the UTC clock,
 cpu/mem/disk/bat = Mac system percentages) · `GET /usage.json` current state for
 the page poller, including `bl` current brightness ·
 `GET|POST /brightness?value=0..255` sets/persists TFT brightness and returns JSON ·
-`GET|POST /mode?screen=mac|claude|desk` switches the physical LCD mode ·
+`GET|POST /mode?screen=mac|claude|desk|face` switches the physical LCD mode
+(`face` = the animated Claude block-mascot companion; it animates via a `millis()`
+poll in `loop()`, **not** a timer ISR, so it adds ~0 IRAM, and its frame interval
+is recomputed from each frame's measured render time so FPS tracks board headroom) ·
+`GET|POST /face?state=idle|working|toggle` flips the companion between the idle
+look-around mascot and a desk-coding scene (headphones on, typing at a laptop), and
+switches the LCD to face mode if it isn't already. The working scene reuses the same
+grid renderer — a second PROGMEM base grid (`deskBase`) + a patch-based frame list
+(`WORK_FRAMES`) with no base shift, an extended `faceCellColor` palette (laptop/desk
+colors), all flash-resident so it adds ~0 IRAM. State is runtime-only (not persisted),
+defaults to idle, and is reported as `face` in `/usage.json` ·
 `GET|POST /desk?status=coding|busy|break` pushes a preset full-screen desk status sign;
 `/desk?text=<up-to-12-safe-chars>&color=green|red|amber|blue|white` pushes custom text/color ·
 `/update` firmware-only OTA upload form.
