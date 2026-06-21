@@ -118,7 +118,12 @@ static const uint8_t SCREEN_MAC = 1;
 static const uint8_t SCREEN_DESK = 2;
 static const uint8_t SCREEN_FACE = 3;
 uint8_t lcdScreen = SCREEN_CLAUDE;
-bool faceWorking = false;       // face mode sub-state: false=idle, true=desk-coding
+static const uint8_t FACE_MODE_IDLE = 0;
+static const uint8_t FACE_MODE_WORKING = 1;
+static const uint8_t FACE_MODE_SLEEP = 2;
+static const uint8_t FACE_MODE_MONK = 3;
+static const uint8_t FACE_MODE_COUNT = 4;   // for the /face?state=toggle wrap
+uint8_t faceMode = FACE_MODE_IDLE; // runtime-only face sub-state
 String deskStatus = "coding";   // coding / meeting / busy / break / claude
 String deskText = "CODING";
 String deskColorName = "green";
@@ -136,6 +141,7 @@ String bootInfo = "";           // detailed reset info (exception cause/stack on
 unsigned long timeBaseEpoch = 0;   // server epoch at the moment of the last push
 unsigned long timeBaseMillis = 0;  // millis() at that same moment
 unsigned long lastTickEpoch = 0;   // last second we redrew the clock/countdown
+uint8_t claudeStatusPulsePhase = 255; // last drawn Claude status pulse frame
 
 // Current UTC epoch. Prefer the daemon-pushed server time (extrapolated via
 // millis()); before the first push, fall back to NTP. 0 = no time source yet.
@@ -214,7 +220,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <section class="panel">
   <div class="label"><span class="name">Device</span><span class="muted" id="mode">waiting</span></div>
   <div class="actions"><a class="btn" href="/usage.json">Usage JSON</a><a class="btn" href="/update">OTA Update</a><a class="btn" href="/restart" id="restartDevice">Restart</a><a class="btn danger" href="/factory-reset" id="factoryReset">Reset Settings</a></div>
-  <div class="control"><span class="muted">Companion</span><div class="actions"><button class="btn faceBtn" data-state="idle">Idle</button><button class="btn faceBtn" data-state="working">Working</button></div><span class="v" id="faceValue">--</span></div>
+  <div class="control"><span class="muted">Companion</span><div class="actions"><button class="btn faceBtn" data-state="idle">Idle</button><button class="btn faceBtn" data-state="working">Working</button><button class="btn faceBtn" data-state="sleep">Sleep</button><button class="btn faceBtn" data-state="monk">Monk</button></div><span class="v" id="faceValue">--</span></div>
   <div class="control"><span class="muted">Desk</span><div class="actions"><button class="btn deskBtn" data-status="coding">Coding</button><button class="btn deskBtn" data-status="meeting">Meeting</button><button class="btn deskBtn" data-status="claude">Claude</button><button class="btn deskBtn" data-status="busy">Busy</button><button class="btn deskBtn" data-status="break">Break</button></div><span class="v" id="deskValue">--</span></div>
   <div class="control"><span class="muted">Custom</span><div class="deskCustom"><input id="deskText" type="text" maxlength="12" value="CODING"><select id="deskColor"><option value="green">Green</option><option value="claude">Claude</option><option value="red">Red</option><option value="amber">Amber</option><option value="blue">Blue</option><option value="white">White</option></select><button class="btn" id="deskApply">Apply</button></div><span></span></div>
   <div class="control"><span class="muted">Brightness</span><input id="brightness" type="range" min="0" max="120" value="90"><span class="v" id="brightnessValue">90</span></div>
@@ -224,7 +230,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 function color(p){return p>=90?'#f85149':p>=60?'#d29922':'#3fb950'}
 var TZ=25200; // Asia/Bangkok UTC+7
 function pad2(n){return (n<10?'0':'')+n}
-function lt(e){return new Date((e+TZ)*1000)} // local (ICT) Date via UTC getters
+function lt(e){return new Date((e+TZ)*1000)} // local UTC+7 Date via UTC getters
 function utcHHMM(e){var d=lt(e);return pad2(d.getUTCHours())+':'+pad2(d.getUTCMinutes())}
 function utcClock(e){var d=lt(e);return utcHHMM(e)+':'+pad2(d.getUTCSeconds())}
 var DOW=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
@@ -391,7 +397,7 @@ async function tick(){
       document.getElementById('mode').textContent='mac system metrics';
     }else if(view=='face'){
       document.getElementById('title').textContent='Companion';
-      document.getElementById('subtitle').textContent=d.face=='working'?'Coding at the desk':'Claude mascot on the cube';
+      document.getElementById('subtitle').textContent=d.face=='working'?'Coding at the desk':d.face=='sleep'?'Claude sleeping on the cube':d.face=='monk'?'Claude meditating on the cube':'Claude mascot on the cube';
       document.getElementById('switchMode').textContent='Claude';
       document.getElementById('switchMode').href='?view=claude';
       document.getElementById('sessionName').textContent='Session window';
@@ -407,7 +413,7 @@ async function tick(){
       document.getElementById('sc').textContent='';
       document.getElementById('wt').textContent='Live on the LCD';
       document.getElementById('wc').textContent='';
-      var mood=d.face=='working'?'CODING':(d.s>=80||d.w>=90||(d.stat&&d.stat!='allowed')?'ALERT':d.s>=40?'FOCUS':'HAPPY');
+      var mood=d.face=='working'?'CODING':d.face=='sleep'?'SLEEP':d.face=='monk'?'ZEN':(d.s>=80||d.w>=90||(d.stat&&d.stat!='allowed')?'ALERT':d.s>=40?'FOCUS':'HAPPY');
       st.textContent='COMPANION - '+mood;
       dot.style.background=mood=='ALERT'?'var(--red)':mood=='FOCUS'?'var(--yellow)':'var(--claude)';
       document.getElementById('mode').textContent='companion face';
@@ -426,10 +432,10 @@ async function tick(){
       document.getElementById('sessionCard').className='panel meter'+(d.bind==1?' bind':'');
       document.getElementById('weeklyCard').className='panel meter'+(d.bind==2?' bind':'');
       document.getElementById('st').textContent =
-        d.sr ? 'Reset '+utcHHMM(d.sr)+' ICT' : 'Reset --';
+        d.sr ? 'Reset '+utcHHMM(d.sr) : 'Reset --';
       document.getElementById('sc').textContent = d.sr&&now ? countdown(d.sr-now) : '--';
       document.getElementById('wt').textContent =
-        d.wr ? 'Reset '+DOW[lt(d.wr).getUTCDay()]+' '+utcHHMM(d.wr)+' ICT' : 'Reset --';
+        d.wr ? 'Reset '+DOW[lt(d.wr).getUTCDay()]+' '+utcHHMM(d.wr) : 'Reset --';
       if(d.s<0){st.textContent='waiting for daemon';dot.style.background='var(--muted)';}
       else{
         var label=(d.stat||'local').toUpperCase();
@@ -534,6 +540,13 @@ static String screenName() {
   return "claude";
 }
 
+static const char *faceModeName() {
+  if (faceMode == FACE_MODE_WORKING) return "working";
+  if (faceMode == FACE_MODE_SLEEP) return "sleep";
+  if (faceMode == FACE_MODE_MONK) return "monk";
+  return "idle";
+}
+
 void handleUsageJson() {
   long age = (sessionPct < 0) ? -1 : (long)((millis() - lastUpdateMs) / 1000);
   String j = "{\"s\":" + String(sessionPct) +
@@ -549,7 +562,7 @@ void handleUsageJson() {
              ",\"disk\":" + String(macDiskPct) +
              ",\"bat\":" + String(macBatteryPct) +
              ",\"screen\":\"" + screenName() + "\"" +
-             ",\"face\":\"" + String(faceWorking ? "working" : "idle") + "\"" +
+             ",\"face\":\"" + String(faceModeName()) + "\"" +
              ",\"desk\":\"" + deskStatus + "\"" +
              ",\"deskText\":\"" + deskText + "\"" +
              ",\"deskColor\":\"" + deskColorName + "\"" +
@@ -717,12 +730,10 @@ void handleFactoryReset() {
 #define C_AMBER  0xFD20
 #define C_CLAUDE 0xDBAA   // warm Claude-style orange accent (#D97757-ish)
 #define C_CLAY   0xCBED   // muted clay (#CD7F6A) — the pixel-creature body color
-#define MAC_USE_SMOOTH_PIE 1
 
 // Display clock/reset times in Thailand time. Pushed epochs are UTC; add the
 // offset only when formatting wall-clock text (durations/countdowns stay raw).
 #define TZ_OFFSET 25200UL   // Asia/Bangkok, UTC+7 (no DST)
-#define TZ_LABEL  "ICT"
 
 static const char *const DOW[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 static const char *const MON[12] = {"Jan","Feb","Mar","Apr","May","Jun",
@@ -737,7 +748,34 @@ static uint16_t barColor(int p) {
 static uint16_t statusColor() {
   if (unifiedStatus.length() == 0) return C_GRAY;
   if (unifiedStatus == "allowed") return C_GREEN;
+  if (sessionPct >= 100 || weeklyPct >= 100) return C_CLAUDE;
   return C_RED;                         // rejected / blocked / queued ...
+}
+
+static uint16_t claudeUsageColor(int pct) {
+  if (pct >= 100) return C_CLAUDE;       // maxed rate: keep the Claude identity color
+  if (pct >= 60) return barColor(pct);
+  return C_CLAUDE;
+}
+
+static void drawClaudeStatusDot(bool force) {
+  if (!unifiedStatus.length()) return;
+
+  const unsigned long cycleMs = 5000UL;
+  const unsigned long pulseMs = 700UL;
+  unsigned long elapsed = millis() % cycleMs;
+  uint8_t phase = elapsed < pulseMs ? (elapsed / 175UL) + 1 : 0;
+  if (!force && phase == claudeStatusPulsePhase) return;
+  claudeStatusPulsePhase = phase;
+
+  uint16_t c = statusColor();
+  gfx->fillRect(64, 4, 17, 18, C_BLACK);
+  if (phase) {
+    int r = 4 + phase;
+    gfx->drawCircle(72, 13, r, c);
+    if (phase < 3) gfx->drawCircle(72, 13, r + 1, c);
+  }
+  gfx->fillCircle(72, 13, 4, c);
 }
 
 static uint16_t deskColor() {
@@ -779,7 +817,7 @@ static void drawClaudeBar(int x, int y, int w, int h, int pct) {
   gfx->drawRect(x, y, w, h, C_LINE);
   if (pct > 0) {
     int p = pct > 100 ? 100 : pct;
-    uint16_t c = pct >= 60 ? barColor(pct) : C_CLAUDE;
+    uint16_t c = claudeUsageColor(pct);
     gfx->fillRect(x + 2, y + 2, (w - 4) * p / 100, h - 4, c);
   }
 }
@@ -864,11 +902,18 @@ static void drawMetricRow(int y, const char *label, int pct, int barX, int barW)
 
 static void drawMacClock(int rightX, int y) {
   unsigned long e = nowEpoch();
-  String t = e ? hhmmss(e + TZ_OFFSET) : String("--:--:--");
-  String z = String(TZ_LABEL);
-  int tzW = textWidth(z, 1);
-  printRight(rightX - tzW - 4, y, 1, t, C_WHITE, C_BLACK);
-  printRight(rightX, y, 1, z, C_GREEN, C_BLACK);
+  String t = e ? hhmm(e + TZ_OFFSET) : String("--:--");
+  printRight(rightX, y, 1, t, C_WHITE, C_BLACK);
+}
+
+// Header "STALE" flag for the MAC screen: the cells freeze at their last pushed
+// values if the daemon stops, so flag it when the last /usage push is old (same
+// 120 s threshold the web dashboard dims at). Gated on lastUpdateMs so a fresh
+// boot with no data yet stays blank instead of reading STALE.
+static void drawMacStaleMarker() {
+  bool stale = (lastUpdateMs != 0) && (millis() - lastUpdateMs > 120000UL);
+  gfx->fillRect(60, 9, 120, 11, C_BLACK);
+  if (stale) printCentered(10, 1, String("STALE"), C_RED, C_BLACK);
 }
 
 static String uptimeText() {
@@ -885,64 +930,27 @@ static uint16_t metricColor(int pct, bool invertColor) {
   return barColor(colorPct);
 }
 
-static void drawMacPieGauge(int cx, int cy, const char *label, int pct, bool invertColor) {
-  const int radius = 35;
-  int p = pct;
-  if (p < 0) p = 0;
-  if (p > 100) p = 100;
-
-  gfx->fillCircle(cx, cy, radius, C_LINE);
-  if (pct >= 0 && p > 0) {
-    uint16_t fillColor = metricColor(pct, invertColor);
-    if (p >= 100) {
-      gfx->fillCircle(cx, cy, radius, fillColor);
-    } else {
-      float sweep = (float)p * 3.6f;
-      if (sweep <= 90.0f) {
-        gfx->fillArc(cx, cy, radius, 0, 270, 270 + sweep, fillColor);
-      } else {
-        gfx->fillArc(cx, cy, radius, 0, 270, 359.9f, fillColor);
-        gfx->fillArc(cx, cy, radius, 0, 0, sweep - 90.0f, fillColor);
-      }
-    }
-  }
-
-  String value = pctText(pct);
-  uint8_t valueSize = value.length() > 3 ? 1 : 2;
-  uint16_t valueColor = pct < 0 ? C_GRAY : C_WHITE;
-  int valueW = textWidth(value, valueSize);
-  gfx->fillRoundRect(cx - valueW / 2 - 4, cy - 10, valueW + 8, 18, 3, C_BLACK);
-  gfx->setTextSize(valueSize);
-  gfx->setTextColor(valueColor, C_BLACK);
-  gfx->setCursor(cx - valueW / 2, cy - (valueSize == 2 ? 7 : 4));
-  gfx->print(value);
+static void drawMacUsageCell(int x, int y, int w, int h,
+                             const char *label, int pct, bool invertColor) {
+  gfx->fillRect(x + 1, y + 1, w - 2, h - 2, C_BLACK);
 
   gfx->setTextSize(1);
   gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor(cx - textWidth(String(label), 1) / 2, cy + 43);
+  gfx->setCursor(x + 10, y + 11);
   gfx->print(label);
-}
 
-static void drawMacLineGauge(int x, int y, const char *label, int pct, bool invertColor) {
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor(x, y);
-  gfx->print(label);
-  printRight(x + 98, y, 1, pctText(pct), C_WHITE, C_BLACK);
-  gfx->fillRect(x, y + 13, 98, 10, C_BLACK);
-  gfx->drawRect(x, y + 13, 98, 10, C_LINE);
+  printRight(x + w - 10, y + 11, 1, pctText(pct), C_WHITE, C_BLACK);
+
+  const int barX = x + 10;
+  const int barY = y + 31;
+  const int barW = w - 20;
+  const int barH = 12;
+  gfx->drawRect(barX, barY, barW, barH, C_LINE);
   if (pct > 0) {
     int p = pct > 100 ? 100 : pct;
-    gfx->fillRect(x + 2, y + 15, 94 * p / 100, 6, metricColor(pct, invertColor));
+    gfx->fillRect(barX + 2, barY + 2, (barW - 4) * p / 100, barH - 4,
+                  metricColor(pct, invertColor));
   }
-}
-
-static void drawMacGauge(int cx, int cy, const char *label, int pct, bool invertColor) {
-#if MAC_USE_SMOOTH_PIE
-  drawMacPieGauge(cx, cy, label, pct, invertColor);
-#else
-  drawMacLineGauge(cx - 49, cy - 12, label, pct, invertColor);
-#endif
 }
 
 static String deskStatusQuote(const String &label) {
@@ -1056,7 +1064,7 @@ static void drawWaiting() {
 }
 
 static void drawClaudeHero() {
-  uint16_t c = sessionPct >= 60 ? barColor(sessionPct) : C_CLAUDE;
+  uint16_t c = claudeUsageColor(sessionPct);
   if (bindingLimit == 1) gfx->fillRect(0, 38, 5, 104, C_AMBER);
 
   gfx->setTextSize(1);
@@ -1113,13 +1121,14 @@ void tickDynamic() {
   }
 
   if (lcdScreen == SCREEN_MAC) {
-    gfx->fillRect(150, 9, 86, 10, C_BLACK);
-    drawMacClock(236, 9);
+    gfx->fillRect(190, 9, 38, 10, C_BLACK);
+    drawMacClock(228, 10);
+    drawMacStaleMarker();
     return;
   }
 
   gfx->fillRect(150, 9, 86, 10, C_BLACK);
-  printRight(236, 9, 1, hhmmss(e + TZ_OFFSET) + " " TZ_LABEL, C_WHITE, C_BLACK);
+  printRight(236, 9, 1, hhmmss(e + TZ_OFFSET), C_WHITE, C_BLACK);
 
   if (lcdScreen == SCREEN_CLAUDE && sessReset) {
     gfx->fillRect(154, 138, 74, 10, C_BLACK);
@@ -1132,22 +1141,27 @@ void drawMacMeter() {
 
   gfx->setTextSize(1);
   gfx->setTextColor(C_CLAUDE, C_BLACK);
-  gfx->setCursor(8, 9);
+  gfx->setCursor(12, 10);
   gfx->print("MAC");
-  drawMacClock(236, 9);
-  gfx->drawFastHLine(0, 29, 240, C_LINE);
+  drawMacClock(228, 10);
+  drawMacStaleMarker();
 
-  drawMacGauge(60, 74, "CPU", macCpuPct, false);
-  drawMacGauge(180, 74, "MEM", macMemPct, false);
-  drawMacGauge(60, 158, "DISK", macDiskPct, false);
-  drawMacGauge(180, 158, "BAT", macBatteryPct, true);
+  gfx->drawRect(4, 4, 232, 232, C_LINE);
+  gfx->drawFastHLine(4, 30, 232, C_LINE);
+  gfx->drawFastHLine(4, 106, 232, C_LINE);
+  gfx->drawFastHLine(4, 182, 232, C_LINE);
+  gfx->drawFastVLine(120, 30, 152, C_LINE);
 
-  gfx->drawFastHLine(0, 214, 240, C_LINE);
+  drawMacUsageCell(4, 30, 116, 76, "CPU", macCpuPct, false);
+  drawMacUsageCell(120, 30, 116, 76, "MEM", macMemPct, false);
+  drawMacUsageCell(4, 106, 116, 76, "DISK", macDiskPct, false);
+  drawMacUsageCell(120, 106, 116, 76, "BAT", macBatteryPct, true);
+
   gfx->setTextSize(1);
   gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor(8, 228);
-  gfx->print(uptimeText());
-  printRight(236, 228, 1, WiFi.localIP().toString(), C_CYAN, C_BLACK);
+  gfx->setCursor(12, 202);
+  gfx->print(String("dev ") + uptimeText());
+  printRight(228, 202, 1, WiFi.localIP().toString(), C_CYAN, C_BLACK);
 }
 
 void drawDeskSign() {
@@ -1194,7 +1208,11 @@ void drawDeskSign() {
 static const uint8_t CELL_EMPTY = 0, CELL_BODY = 1, CELL_EYE = 2,
                      CELL_HP_LIGHT = 3, CELL_HP_SHADOW = 4, CELL_SCREEN = 5,
                      CELL_LBASE = 6, CELL_LOGO = 7, CELL_DESKTOP = 8,
-                     CELL_DESKLEG = 9;
+                     CELL_DESKLEG = 9,
+                     // The "monk" meditation scene: an orange Claude sunburst face
+                     // (CELL_SPARK) over a static white stone robe (CELL_ROBE), with
+                     // grey fold/edge shadows (CELL_ROBE_SHADE) that give it shape.
+                     CELL_SPARK = 10, CELL_ROBE = 11, CELL_ROBE_SHADE = 12;
 // RGB565 for the desk-scene cells (converted from the reference #hex palette).
 #define C_HP_LIGHT  0xD6FC   // headphone light  #d4dde2
 #define C_HP_SHADOW 0x8C93   // headphone shadow #8a9199
@@ -1372,6 +1390,148 @@ static const FaceFrame WORK_FRAMES[] = {
 };
 static const uint8_t WORK_NFRAMES = sizeof(WORK_FRAMES) / sizeof(WORK_FRAMES[0]);
 
+// ---- "Sleep" scene: closed eyes, slow breathing nod, and drifting Z particles --
+// Same creature base as idle. Shifted frames close the eyes at the shifted rows,
+// because faceBuildGrid applies the sparse patch after the base shift.
+static const FacePatch S_SLEEP[] = {
+  {6,7,CELL_BODY},{7,7,CELL_BODY},{6,13,CELL_BODY},{7,13,CELL_BODY},
+};
+static const FacePatch S_NOD_DOWN[] = {
+  {7,7,CELL_BODY},{8,7,CELL_BODY},{7,13,CELL_BODY},{8,13,CELL_BODY},
+};
+static const FacePatch S_NOD_UP[] = {
+  {5,7,CELL_BODY},{6,7,CELL_BODY},{5,13,CELL_BODY},{6,13,CELL_BODY},
+};
+static const FacePatch S_Z1[] = {
+  {6,7,CELL_BODY},{7,7,CELL_BODY},{6,13,CELL_BODY},{7,13,CELL_BODY},
+  {3,15,CELL_BODY},{3,16,CELL_BODY},{4,15,CELL_BODY},{4,16,CELL_BODY},
+};
+static const FacePatch S_Z2[] = {
+  {6,7,CELL_BODY},{7,7,CELL_BODY},{6,13,CELL_BODY},{7,13,CELL_BODY},
+  {2,16,CELL_BODY},{2,17,CELL_BODY},{3,16,CELL_BODY},{3,17,CELL_BODY},
+  {4,15,CELL_BODY},
+};
+static const FacePatch S_Z3[] = {
+  {6,7,CELL_BODY},{7,7,CELL_BODY},{6,13,CELL_BODY},{7,13,CELL_BODY},
+  {1,17,CELL_BODY},{1,18,CELL_BODY},{2,17,CELL_BODY},{2,18,CELL_BODY},
+  {3,16,CELL_BODY},
+};
+static const FacePatch S_Z4[] = {
+  {6,7,CELL_BODY},{7,7,CELL_BODY},{6,13,CELL_BODY},{7,13,CELL_BODY},
+  {0,18,CELL_BODY},{1,18,CELL_BODY},{2,17,CELL_BODY},
+};
+static const FacePatch S_Z5[] = {
+  {6,7,CELL_BODY},{7,7,CELL_BODY},{6,13,CELL_BODY},{7,13,CELL_BODY},
+  {0,18,CELL_BODY},{0,19,CELL_BODY},
+};
+static const FacePatch S_NOD_DOWN_Z[] = {
+  {7,7,CELL_BODY},{8,7,CELL_BODY},{7,13,CELL_BODY},{8,13,CELL_BODY},
+  {4,15,CELL_BODY},{4,16,CELL_BODY},
+};
+static const FacePatch S_NOD_UP_Z2[] = {
+  {5,7,CELL_BODY},{6,7,CELL_BODY},{5,13,CELL_BODY},{6,13,CELL_BODY},
+  {2,16,CELL_BODY},{2,17,CELL_BODY},{3,16,CELL_BODY},
+};
+static const FaceFrame SLEEP_FRAMES[] = {
+  {600,  0, 0, FACE_PATCH(S_SLEEP)},
+  {400,  1, 0, FACE_PATCH(S_NOD_DOWN)},
+  {300,  0, 0, FACE_PATCH(S_SLEEP)},
+  {300,  0, 0, FACE_PATCH(S_Z1)},
+  {300,  1, 0, FACE_PATCH(S_NOD_DOWN_Z)},
+  {300,  0, 0, FACE_PATCH(S_Z1)},
+  {300,  0, 0, FACE_PATCH(S_Z2)},
+  {300, -1, 0, FACE_PATCH(S_NOD_UP_Z2)},
+  {300,  0, 0, FACE_PATCH(S_Z3)},
+  {300,  1, 0, FACE_PATCH(S_NOD_DOWN)},
+  {300,  0, 0, FACE_PATCH(S_Z4)},
+  {300,  0, 0, FACE_PATCH(S_SLEEP)},
+  {300,  0, 0, FACE_PATCH(S_Z5)},
+  {400, -1, 0, FACE_PATCH(S_NOD_UP)},
+  {700,  0, 0, FACE_PATCH(S_SLEEP)},
+  {400,  1, 0, FACE_PATCH(S_NOD_DOWN)},
+  {500,  0, 0, FACE_PATCH(S_SLEEP)},
+  {300,  0, 0, FACE_PATCH(S_Z1)},
+  {300,  0, 0, FACE_PATCH(S_Z2)},
+  {300, -1, 0, FACE_PATCH(S_NOD_UP)},
+  {300,  0, 0, FACE_PATCH(S_Z3)},
+  {300,  0, 0, FACE_PATCH(S_Z4)},
+  {300,  0, 0, FACE_PATCH(S_Z5)},
+  {400,  0, 0, FACE_PATCH(S_SLEEP)},
+};
+static const uint8_t SLEEP_NFRAMES = sizeof(SLEEP_FRAMES) / sizeof(SLEEP_FRAMES[0]);
+
+// ---- "Monk" scene: the Claude block-mascot seated in meditation -----------------
+// A white stone monk (CELL_ROBE) sitting cross-legged with a raised open palm and
+// grey robe-fold shadows (CELL_ROBE_SHADE) for shape. The HEAD is a SMALL white
+// circular dome (cols 8-12, rows 4-8 — a 5x5 circle proportioned to the seated
+// body, not the old head-filling dome) carrying an 8-point Claude burst (CELL_SPARK).
+// The BODY is SLIM — tapered to match the
+// 5-wide head rather than the old wide base: shoulders 8 (cols 6-13), torso 7
+// (cols 7-13), crossed-leg knees 11 (cols 5-15), cushion 9 (cols 6-14), all
+// centered on col 10 like the head. Only the raised left palm (cols 5-6, row 9)
+// breaks that symmetry — that asymmetry IS the meditation gesture. The burst is
+// sized to fill that small head exactly: a vertical spoke (col 10), a horizontal arm
+// (row 6, cols 8-12) and four diagonals converging on the hub. The white dome shows
+// through only as four wedge cells between the spokes and a thin rim halo — the burst
+// is the same size as the head. Unlike the other scenes the BODY never shifts
+// (meditation is still): the only motion is the burst, whose minor spokes shimmer in
+// over the white wedges by toggling tip cells. Those tip cells sit on dome (white)
+// cells, so a retracted spoke reverts to white — a clean pulse with no black holes.
+// Patch coords are absolute (no dr), so the spokes always line up with the static hub
+// — same reason the desk scene uses dr=0.
+#define SP CELL_SPARK
+#define RB CELL_ROBE
+#define GS CELL_ROBE_SHADE
+#define __ CELL_EMPTY
+static const uint8_t monkBase[F_N][F_N] PROGMEM = {
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, // 0
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, // 1
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, // 2
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, // 3
+  {__,__,__,__,__,__,__,__,__,RB,SP,RB,__,__,__,__,__,__,__,__}, // 4 dome top + N spoke
+  {__,__,__,__,__,__,__,__,SP,RB,SP,RB,SP,__,__,__,__,__,__,__}, // 5 NW / N / NE spokes
+  {__,__,__,__,__,__,__,__,SP,SP,SP,SP,SP,__,__,__,__,__,__,__}, // 6 horizontal arm + hub
+  {__,__,__,__,__,__,__,__,SP,RB,SP,RB,SP,__,__,__,__,__,__,__}, // 7 SW / S / SE spokes
+  {__,__,__,__,__,__,__,__,__,RB,SP,RB,__,__,__,__,__,__,__,__}, // 8 dome bottom + S spoke
+  {__,__,__,__,__,RB,RB,__,__,RB,RB,RB,__,__,__,__,__,__,__,__}, // 9 raised palm + neck
+  {__,__,__,__,__,__,RB,RB,RB,RB,RB,RB,RB,RB,__,__,__,__,__,__}, //10 forearm + shoulders
+  {__,__,__,__,__,__,__,RB,RB,RB,GS,RB,RB,RB,__,__,__,__,__,__}, //11 torso + center fold
+  {__,__,__,__,__,__,__,RB,RB,RB,GS,RB,RB,RB,__,__,__,__,__,__}, //12 torso + center fold
+  {__,__,__,__,__,__,RB,RB,RB,RB,RB,RB,RB,RB,RB,__,__,__,__,__}, //13 lap
+  {__,__,__,__,__,RB,RB,RB,RB,GS,GS,GS,RB,RB,RB,RB,__,__,__,__}, //14 crossed legs + seam
+  {__,__,__,__,__,RB,RB,RB,RB,RB,GS,RB,RB,RB,RB,RB,__,__,__,__}, //15 crossed legs + seam
+  {__,__,__,__,__,__,RB,RB,RB,RB,RB,RB,RB,RB,RB,__,__,__,__,__}, //16 cushion
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, //17
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, //18
+  {__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__,__}, //19
+};
+#undef SP
+#undef RB
+#undef GS
+#undef __
+
+// Minor burst-spoke tips (absolute coords, no base shift). The base shows the eight
+// main spokes; the preset shimmers the four white wedge cells between them — set A
+// then set B (a slow rotation), with a brief full burst in between. Every tip lands
+// on a dome (white) cell, so when a spoke retracts the cell reverts to white, never
+// black.
+static const FacePatch M_RAY_A[] = {
+  {5,9,CELL_SPARK},{7,11,CELL_SPARK},
+};
+static const FacePatch M_RAY_B[] = {
+  {5,11,CELL_SPARK},{7,9,CELL_SPARK},
+};
+static const FacePatch M_RAY_BURST[] = {
+  {5,9,CELL_SPARK},{5,11,CELL_SPARK},{7,9,CELL_SPARK},{7,11,CELL_SPARK},
+};
+static const FaceFrame MONK_FRAMES[] = {
+  {520, 0, 0, FACE_PATCH(M_RAY_A)},
+  {200, 0, 0, FACE_PATCH(M_RAY_BURST)},
+  {520, 0, 0, FACE_PATCH(M_RAY_B)},
+  {200, 0, 0, FACE_PATCH(M_RAY_BURST)},
+};
+static const uint8_t MONK_NFRAMES = sizeof(MONK_FRAMES) / sizeof(MONK_FRAMES[0]);
+
 static uint8_t faceGrid[F_N][F_N];   // the frame currently shown
 static uint8_t facePrev[F_N][F_N];   // last grid drawn (for cell diffing)
 static bool faceInit = false;
@@ -1382,8 +1542,19 @@ static uint8_t faceMoodId = 255;
 static unsigned long faceClockSec = 0;
 
 // Pick the active scene (base grid + frame list) by state.
-static const FaceFrame *faceFrameList() { return faceWorking ? WORK_FRAMES : FACE_FRAMES; }
-static uint8_t faceFrameCount() { return faceWorking ? WORK_NFRAMES : FACE_NFRAMES; }
+static const FaceFrame *faceFrameList() {
+  if (faceMode == FACE_MODE_WORKING) return WORK_FRAMES;
+  if (faceMode == FACE_MODE_SLEEP) return SLEEP_FRAMES;
+  if (faceMode == FACE_MODE_MONK) return MONK_FRAMES;
+  return FACE_FRAMES;
+}
+
+static uint8_t faceFrameCount() {
+  if (faceMode == FACE_MODE_WORKING) return WORK_NFRAMES;
+  if (faceMode == FACE_MODE_SLEEP) return SLEEP_NFRAMES;
+  if (faceMode == FACE_MODE_MONK) return MONK_NFRAMES;
+  return FACE_NFRAMES;
+}
 
 static FaceExpr faceComputeExpr() {
   FaceExpr e;
@@ -1404,9 +1575,11 @@ static FaceExpr faceComputeExpr() {
     e.eyeH = 26; e.mouth = 0; e.id = 0; e.mood = "HAPPY";
   }
   e.body = C_CLAY; e.spark = C_CLAUDE;
-  // Working state overrides the mood label (id 10 is distinct so a toggle is seen
-  // as a mood change and forces a status repaint).
-  if (faceWorking) { e.mood = "CODING"; e.id = 10; }
+  // Explicit scene states override the mood label. Distinct ids force a status
+  // repaint when switching scenes even if the body palette stays unchanged.
+  if (faceMode == FACE_MODE_WORKING) { e.mood = "CODING"; e.id = 10; }
+  else if (faceMode == FACE_MODE_SLEEP) { e.mood = "SLEEP"; e.id = 11; }
+  else if (faceMode == FACE_MODE_MONK) { e.mood = "ZEN"; e.id = 12; }
   return e;
 }
 
@@ -1422,6 +1595,9 @@ static uint16_t faceCellColor(uint8_t v, uint16_t body) {
     case CELL_LOGO:      return C_LOGO;
     case CELL_DESKTOP:   return C_DESKTOP;
     case CELL_DESKLEG:   return C_DESKLEG;
+    case CELL_SPARK:     return C_CLAUDE;    // monk sunburst face (orange)
+    case CELL_ROBE:      return C_WHITE;     // monk stone robe (static, not mood-tinted)
+    case CELL_ROBE_SHADE: return C_GRAY;     // robe fold/edge shadow (gives shape)
     default:             return C_BLACK;     // empty + eye (holes read as black)
   }
 }
@@ -1448,7 +1624,9 @@ static void faceBuildGrid(uint8_t out[F_N][F_N], const FaceFrame &f,
 
 // The base grid for the active scene.
 static const uint8_t (*faceActiveBase())[F_N] {
-  return faceWorking ? deskBase : creatureBase;
+  if (faceMode == FACE_MODE_WORKING) return deskBase;
+  if (faceMode == FACE_MODE_MONK) return monkBase;
+  return creatureBase;
 }
 
 // Repaint the grid. force=true redraws every cell (used on a body-color change);
@@ -1569,7 +1747,7 @@ void drawMeter() {
   gfx->print("CLAUDE");
   if (unifiedStatus.length()) {
     uint16_t c = statusColor();
-    gfx->fillCircle(72, 13, 4, c);
+    drawClaudeStatusDot(true);
     String label = unifiedStatus;
     label.toUpperCase();
     if (label.length() > 10) label = label.substring(0, 10);
@@ -1578,8 +1756,8 @@ void drawMeter() {
     gfx->print(label);
   }
   unsigned long e = nowEpoch();
-  printRight(236, 9, 1, e ? hhmmss(e + TZ_OFFSET) + " " TZ_LABEL
-                          : String("--:--:-- " TZ_LABEL), C_WHITE, C_BLACK);
+  printRight(236, 9, 1, e ? hhmmss(e + TZ_OFFSET) : String("--:--:--"),
+             C_WHITE, C_BLACK);
   gfx->drawFastHLine(0, 29, 240, C_CLAUDE);
 
   drawClaudeHero();
@@ -1587,24 +1765,26 @@ void drawMeter() {
   drawIpPanel();
 }
 
-// Toggle the companion between idle (look-around) and working (desk-coding).
-// /face?state=idle|working|toggle . Switches the LCD to face mode if needed and
+// Toggle the companion between idle (look-around), working (desk-coding), and sleep.
+// /face?state=idle|working|sleep|monk|toggle . Switches the LCD to face mode if needed and
 // restarts the animation so the new scene draws immediately. Defined after
 // drawMeter()/faceBegin() so it can call them without a forward prototype.
 void handleFace() {
   if (server.hasArg("state")) {
     String st = server.arg("state");
     st.toLowerCase();
-    if (st == "working") faceWorking = true;
-    else if (st == "idle") faceWorking = false;
-    else if (st == "toggle") faceWorking = !faceWorking;
+    if (st == "working") faceMode = FACE_MODE_WORKING;
+    else if (st == "sleep") faceMode = FACE_MODE_SLEEP;
+    else if (st == "monk") faceMode = FACE_MODE_MONK;
+    else if (st == "idle") faceMode = FACE_MODE_IDLE;
+    else if (st == "toggle") faceMode = (faceMode + 1) % FACE_MODE_COUNT;
     lcdScreen = SCREEN_FACE;
     lastTickEpoch = 0;
     faceInit = false;        // force a fresh faceBegin() for the new scene
     drawMeter();
   }
   server.sendHeader("Connection", "close");
-  server.send(200, "text/plain", faceWorking ? "working" : "idle");
+  server.send(200, "text/plain", faceModeName());
 }
 
 void handleUpdateDone() {
@@ -1720,7 +1900,7 @@ void setup() {
   // lot -> the ESP8266 runs cooler. CPU stays on, so the web server stays responsive.
   WiFi.setSleepMode(WIFI_MODEM_SLEEP);
 
-  // NTP in UTC (we apply the ICT offset at display time). This gives the wait
+  // NTP in UTC (we apply the UTC+7 offset at display time). This gives the wait
   // screen a clock before the daemon ever pushes; daemon time takes over later.
   configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
@@ -1765,7 +1945,10 @@ void loop() {
   }
   if (meterRedrawPending) {
     meterRedrawPending = false;
-    drawMeter();
+    // The face scene animates continuously and faceTick() already absorbs new
+    // usage/mood values, so a daemon push must NOT call faceBegin() — that would
+    // fillScreen + restart the animation from frame 0 (a once-a-minute flash).
+    if (lcdScreen != SCREEN_FACE) drawMeter();
   }
 
   if (lcdScreen == SCREEN_FACE) {
@@ -1779,12 +1962,22 @@ void loop() {
     drawDeskAnimatedStatus();
   }
 
+  if (lcdScreen == SCREEN_CLAUDE && unifiedStatus.length() &&
+      sessionPct >= 0 && weeklyPct >= 0) {
+    drawClaudeStatusDot(false);
+  }
+
   unsigned long e = nowEpoch();
   if (e != 0) {
     if (lcdScreen == SCREEN_CLAUDE && sessionPct < 0 && weeklyPct < 0) {
       // Wait screen: refresh the big clock/date once a minute.
       unsigned long minute = e / 60UL;
       if (minute != lastTickEpoch) { lastTickEpoch = minute; drawWaitingTime(); }
+    } else if (lcdScreen == SCREEN_MAC) {
+      // MAC clock is HH:MM, so refresh it once a minute. Daemon /usage pushes
+      // still trigger a full redraw through meterRedrawPending above.
+      unsigned long minute = e / 60UL;
+      if (minute != lastTickEpoch) { lastTickEpoch = minute; tickDynamic(); }
     } else if (e != lastTickEpoch) {
       // With data: tick the clock + countdown once a second, no full redraw.
       lastTickEpoch = e;

@@ -123,13 +123,17 @@ the page poller, including `bl` current brightness ·
 (`face` = the animated Claude block-mascot companion; it animates via a `millis()`
 poll in `loop()`, **not** a timer ISR, so it adds ~0 IRAM, and its frame interval
 is recomputed from each frame's measured render time so FPS tracks board headroom) ·
-`GET|POST /face?state=idle|working|toggle` flips the companion between the idle
-look-around mascot and a desk-coding scene (headphones on, typing at a laptop), and
-switches the LCD to face mode if it isn't already. The working scene reuses the same
-grid renderer — a second PROGMEM base grid (`deskBase`) + a patch-based frame list
-(`WORK_FRAMES`) with no base shift, an extended `faceCellColor` palette (laptop/desk
-colors), all flash-resident so it adds ~0 IRAM. State is runtime-only (not persisted),
-defaults to idle, and is reported as `face` in `/usage.json` ·
+`GET|POST /face?state=idle|working|sleep|monk|toggle` flips the companion between the
+idle look-around mascot, a desk-coding scene (headphones on, typing at a laptop),
+a sleeping scene (closed eyes, breathing nod, drifting Z particles), and a meditating
+"claude monk" scene (a white stone statue with grey robe-fold shadows and a raised
+palm; the head is a white circular dome with the orange Claude burst overlaid so the
+white shows as a halo ring around the spokes — the body holds still while the burst
+spokes radiate), and switches the LCD to face mode if it isn't already. Extra scenes
+reuse the same grid renderer: `deskBase` + `WORK_FRAMES` for coding, `SLEEP_FRAMES`
+over the idle base for sleep, and `monkBase` + `MONK_FRAMES` for the monk. State is
+runtime-only (not persisted), defaults to idle, and is reported as `face` in
+`/usage.json` ·
 `GET|POST /desk?status=coding|meeting|busy|break|claude` pushes a preset full-screen desk status sign
 (`coding` green, `meeting` blue, `busy` red, `break` amber, `claude` Claude-orange);
 `/desk?text=<up-to-12-safe-chars>&color=green|red|amber|blue|white|claude` pushes custom text;

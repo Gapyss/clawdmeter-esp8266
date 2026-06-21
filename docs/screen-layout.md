@@ -2,30 +2,30 @@
 
 240×240 ST7789 TFT. This is the **`api`-mode dashboard**: every field maps to a
 real Anthropic rate-limit response header (see the daemon's `extra_from_headers`).
-Clock + reset times are shown in **Thailand time (ICT, UTC+7)** — the device clock
-is synced from the `Date` response header the daemon pushes (no RTC/NTP), then
-ticks once per second off `millis()`. The `TZ_OFFSET`/`TZ_LABEL` `#define`s set the
-zone (durations/countdowns stay raw, so they are timezone-independent).
+Clock + reset times are shown in **Thailand time (UTC+7)** — the device clock is
+synced from the `Date` response header the daemon pushes (no RTC/NTP), then
+ticks once per second off `millis()`. The `TZ_OFFSET` `#define` sets the zone
+(durations/countdowns stay raw, so they are timezone-independent).
 
 ## Normal state (data received)
 
 Below, the example header values are 08:43 / 13:20 / Tue 18:00 **UTC**, shown as
-their ICT equivalents (+7h).
+their UTC+7 equivalents.
 
 ```
 ┌────────────────────────────────────────┐ y=0
-│ ✣ CLAUDE  ● ALLOWED       15:43:41 ICT  │  spark icon + title (orange) + dot/text = unified-status + clock
+│ ✣ CLAUDE  ● ALLOWED           15:43:41  │  spark icon + title (orange) + dot/text = unified-status + clock
 ├────────────────────────────────────────┤ y=29   orange separator
 │▌SESSION 5h                              │  ▌ amber stripe if this is the binding limit
 │▌                                      │
 │▌                 25%                    │  large hero percentage = unified-5h-utilization (orange < 60%)
 │▌                                      │
 │▌ ▓▓▓▓▓▓░░░░░░░░░░░░░░░░░░               │  bar = unified-5h-utilization (Claude orange < 60%)
-│ reset 20:20              T-4h37m        │  reset HH:MM ICT + live countdown
+│ reset 20:20              T-4h37m        │  reset HH:MM + live countdown
 │                                        │
 │ WEEKLY                            12%   │
 │ ▓▓▓░░░░░░░░░░░░░░░░░░░░░░               │  bar = unified-7d-utilization (Claude orange < 60%)
-│ reset Wed 01:00                         │  unified-7d-reset (Dow HH:MM ICT)
+│ reset Wed 01:00                         │  unified-7d-reset (Dow HH:MM)
 │                         IP 192.168.1.42 │
 └────────────────────────────────────────┘ y=240
 ```
@@ -33,22 +33,25 @@ their ICT equivalents (+7h).
 This screen is Claude-themed: a small Claude spark icon (`drawClaudeIcon`) and
 orange `CLAUDE` title at the top, an orange separator, and progress bars
 (`drawClaudeBar`) that render in Claude orange until usage hits 60%, then switch
-to the yellow/red warning colors. The big hero percentage follows the same rule.
+to the yellow/red warning colors. At 100% utilization, the Claude screen returns
+to Claude orange for the max-rate state. The big hero percentage follows the
+same rule.
 
 Claude geometry: spark icon centered at `(10,13)`, title `CLAUDE` at `x=24` `y=9`,
 status dot at `(72,13)` with its word at `x=82`; separator `y=29`; session label
 `y=40`, big percentage `textSize 5` at `y=57`, session bar `16,112` size `208×18`,
 reset line `y=138`; weekly label `y=160`, weekly bar `16,184` size `208×12`, reset
 line `y=204`; compact IP readout at `y=230`. The clock and the session countdown
-are the only per-second redraws (`tickDynamic`); everything else redraws on a
-daemon push.
+redraw once per second (`tickDynamic`). The status dot also emits a short
+non-blocking pulse every 5 seconds, repainting only the dot's small bounding box;
+everything else redraws on a daemon push.
 
 ## Field → header map (`api` mode)
 
 | Screen | Header | Notes |
 |--------|--------|-------|
-| Status dot/word (after the `CLAUDE` title) | `anthropic-ratelimit-unified-status` | `allowed` → green, else red |
-| Clock | `Date` response header | pushed as epoch `t`, ticked from `millis()`, shown in ICT |
+| Status dot/word (after the `CLAUDE` title) | `anthropic-ratelimit-unified-status` | `allowed` → green, max-rate deny → Claude orange, else red |
+| Clock | `Date` response header | pushed as epoch `t`, ticked from `millis()`, shown in UTC+7 |
 | SESSION % + bar | `anthropic-ratelimit-unified-5h-utilization` | 0..1 → ×100 |
 | Reset HH:MM + countdown | `anthropic-ratelimit-unified-5h-reset` | unix epoch |
 | WEEKLY % + bar | `anthropic-ratelimit-unified-7d-utilization` | |
@@ -64,12 +67,12 @@ dot/word), and there is no clock/countdown.
 Shown when both `sessionPct` and `weeklyPct` are still −1. The device has no
 daemon time yet, so the clock comes from **NTP** (`configTime`, synced once WiFi
 is up) — `nowEpoch()` falls back to it until the first push. The big clock/date
-refresh **once a minute** (`drawWaitingTime` from `loop`); both are in ICT.
+refresh **once a minute** (`drawWaitingTime` from `loop`); both are UTC+7.
 
 ```
 ┌────────────────────────────────────────┐
 │                                        │
-│                14:06                   │  textSize 4, NTP clock (ICT)
+│                14:06                   │  textSize 4, NTP clock (UTC+7)
 │             sat 20 jun                 │  textSize 2, gray (civil_from_days)
 │         ──────────────────             │
 │           waiting for data             │
@@ -82,20 +85,22 @@ refresh **once a minute** (`drawWaitingTime` from `loop`); both are in ICT.
 
 ```
 ┌────────────────────────────────────────┐
-│ MAC                         15:43:41 ICT│
-├────────────────────────────────────────┤
-│      ◔ CPU              ◑ MEM          │
-│                                        │
-│      ◒ DISK             ◕ BAT          │
-│                                        │
-│                         IP 192.168.1.42 │
+│ MAC                                15:43│
+├────────────────────┬───────────────────┤
+│ CPU           42%  │ MEM           68% │
+│ █████░░░░░░░░░░░░  │ ███████░░░░░░░░░  │
+├────────────────────┼───────────────────┤
+│ DISK          55%  │ BAT           91% │
+│ ██████░░░░░░░░░░░  │ ██████████░░░░░░  │
+├────────────────────┴───────────────────┤
+│ ↑3d 04h                  192.168.1.42  │
 └────────────────────────────────────────┘
 ```
 
-CPU, memory, disk, and battery use a 2×2 smooth pie layout when Arduino_GFX
-`fillArc()` is available. Battery color is inverted so higher charge reads
-healthier. The firmware keeps a compile-time line-bar fallback behind
-`MAC_USE_SMOOTH_PIE`.
+CPU, memory, disk, and battery use a 2×2 line-bar layout with only the
+percentage and bar for each metric. Battery color is inverted so higher charge
+reads healthier. The footer shows ESP uptime on the left and WiFi IP on the
+right.
 
 ## Desk status screen
 
@@ -105,7 +110,7 @@ healthier. The firmware keeps a compile-time line-bar fallback behind
 │                                        │
 │                CODING                  │  large centered status text
 │             ─────────────              │
-│                17:47                   │  HH:MM only (no seconds, no ICT label)
+│                17:47                   │  HH:MM only
 │          ship the small thing          │
 │                         IP 192.168.1.42│
 └────────────────────────────────────────┘
@@ -136,7 +141,7 @@ text (typed in like the others), clock, G4PYS footer, and IP.
 │                                        │
 │                CLAUDE                  │
 │             ─────────────              │
-│             15:43:41 ICT               │
+│                15:43                   │
 │           assistant online             │
 │                         IP 192.168.1.42│
 └────────────────────────────────────────┘
