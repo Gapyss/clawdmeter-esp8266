@@ -84,20 +84,18 @@ refresh **once a minute** (`drawWaitingTime` from `loop`); both are in ICT.
 ┌────────────────────────────────────────┐
 │ MAC                         15:43:41 ICT│
 ├────────────────────────────────────────┤
-│ CPU                              42%    │
-│        ▓▓▓▓▓▓░░░░░░░░░░                 │
-│ MEM                              68%    │
-│        ▓▓▓▓▓▓▓▓▓▓░░░░░                  │
-│ DISK                             55%    │
-│        ▓▓▓▓▓▓▓▓░░░░░░                   │
-│        ────────────────────            │
-│ BATTERY                         91%     │
+│      ◔ CPU              ◑ MEM          │
+│                                        │
+│      ◒ DISK             ◕ BAT          │
+│                                        │
 │                         IP 192.168.1.42 │
 └────────────────────────────────────────┘
 ```
 
-CPU, memory, and disk use compact rows. Battery is separated as a footer because
-it changes more slowly and should be scannable at a glance.
+CPU, memory, disk, and battery use a 2×2 smooth pie layout when Arduino_GFX
+`fillArc()` is available. Battery color is inverted so higher charge reads
+healthier. The firmware keeps a compile-time line-bar fallback behind
+`MAC_USE_SMOOTH_PIE`.
 
 ## Desk status screen
 
@@ -107,18 +105,30 @@ it changes more slowly and should be scannable at a glance.
 │                                        │
 │                CODING                  │  large centered status text
 │             ─────────────              │
-│             15:43:41 ICT               │
-│                 G4PYS                  │
+│                17:47                   │  HH:MM only (no seconds, no ICT label)
+│          ship the small thing          │
 │                         IP 192.168.1.42│
 └────────────────────────────────────────┘
 ```
 
-The dashboard can set preset states (`coding`, `claude`, `busy`, `break`) or
-custom text and color. The physical screen intentionally omits setup/help copy so
-it reads as a status sign from desk distance.
+The dashboard can set preset states (`coding`, `meeting`, `claude`, `busy`,
+`break`) or custom text and color. The physical screen intentionally omits
+setup/help copy so it reads as a status sign from desk distance. The footer line
+is a short quote related to the active status. Every desk word — presets and
+custom text alike — animates as a typing label with a real blinking cursor:
+characters advance about every 800 ms, the cursor blinks every 500 ms, and the
+full word holds for 30 seconds before repeating. The label is left-anchored at
+its final width so letters land in place instead of re-centering each frame, and
+a frame is only repainted when it actually changes (no idle flicker during the
+hold).
 
-Claude desk preset (`/desk?status=claude`) is static: Claude orange header,
-large `CLAUDE` text, clock, G4PYS footer, and IP.
+Custom text (`/desk?text=...`) renders in the monochrome "tokenme.limited" look —
+bold **white** header and text on black, ignoring the `?color=` param — on a
+single centered line with the same typewriter + blinking cursor. Presets keep
+their status color.
+
+Claude desk preset (`/desk?status=claude`): Claude orange header, large `CLAUDE`
+text (typed in like the others), clock, G4PYS footer, and IP.
 
 ```
 ┌████████████████████████████████████████┐  Claude orange header
@@ -127,7 +137,7 @@ large `CLAUDE` text, clock, G4PYS footer, and IP.
 │                CLAUDE                  │
 │             ─────────────              │
 │             15:43:41 ICT               │
-│                 G4PYS                  │
+│           assistant online             │
 │                         IP 192.168.1.42│
 └────────────────────────────────────────┘
 ```

@@ -159,6 +159,7 @@ To push a desk status directly:
 
 ```text
 http://clawdmeter.local/desk?status=coding
+http://clawdmeter.local/desk?status=meeting
 http://clawdmeter.local/desk?status=claude
 http://clawdmeter.local/desk?status=busy
 http://clawdmeter.local/desk?status=break

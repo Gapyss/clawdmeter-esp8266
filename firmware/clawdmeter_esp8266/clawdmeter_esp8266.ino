@@ -119,9 +119,12 @@ static const uint8_t SCREEN_DESK = 2;
 static const uint8_t SCREEN_FACE = 3;
 uint8_t lcdScreen = SCREEN_CLAUDE;
 bool faceWorking = false;       // face mode sub-state: false=idle, true=desk-coding
-String deskStatus = "coding";   // coding / busy / break
+String deskStatus = "coding";   // coding / meeting / busy / break / claude
 String deskText = "CODING";
 String deskColorName = "green";
+unsigned long deskTypingStartMs = 0;
+unsigned long deskAnimLastMs = 0;
+String deskLastShown = "";       // last drawn typing frame; skip redraw when unchanged
 bool otaInProgress = false;     // true while /update is writing firmware
 bool otaUpdateOk = false;
 bool meterRedrawPending = false;
@@ -212,7 +215,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   <div class="label"><span class="name">Device</span><span class="muted" id="mode">waiting</span></div>
   <div class="actions"><a class="btn" href="/usage.json">Usage JSON</a><a class="btn" href="/update">OTA Update</a><a class="btn" href="/restart" id="restartDevice">Restart</a><a class="btn danger" href="/factory-reset" id="factoryReset">Reset Settings</a></div>
   <div class="control"><span class="muted">Companion</span><div class="actions"><button class="btn faceBtn" data-state="idle">Idle</button><button class="btn faceBtn" data-state="working">Working</button></div><span class="v" id="faceValue">--</span></div>
-  <div class="control"><span class="muted">Desk</span><div class="actions"><button class="btn deskBtn" data-status="coding">Coding</button><button class="btn deskBtn" data-status="claude">Claude</button><button class="btn deskBtn" data-status="busy">Busy</button><button class="btn deskBtn" data-status="break">Break</button></div><span class="v" id="deskValue">--</span></div>
+  <div class="control"><span class="muted">Desk</span><div class="actions"><button class="btn deskBtn" data-status="coding">Coding</button><button class="btn deskBtn" data-status="meeting">Meeting</button><button class="btn deskBtn" data-status="claude">Claude</button><button class="btn deskBtn" data-status="busy">Busy</button><button class="btn deskBtn" data-status="break">Break</button></div><span class="v" id="deskValue">--</span></div>
   <div class="control"><span class="muted">Custom</span><div class="deskCustom"><input id="deskText" type="text" maxlength="12" value="CODING"><select id="deskColor"><option value="green">Green</option><option value="claude">Claude</option><option value="red">Red</option><option value="amber">Amber</option><option value="blue">Blue</option><option value="white">White</option></select><button class="btn" id="deskApply">Apply</button></div><span></span></div>
   <div class="control"><span class="muted">Brightness</span><input id="brightness" type="range" min="0" max="120" value="90"><span class="v" id="brightnessValue">90</span></div>
 </section>
@@ -622,11 +625,15 @@ void handleDesk() {
   if (server.hasArg("status")) {
     String status = server.arg("status");
     status.toLowerCase();
-    if (status == "coding" || status == "busy" || status == "break" || status == "claude") {
+    if (status == "coding" || status == "meeting" || status == "busy" ||
+        status == "break" || status == "claude") {
       deskStatus = status;
       if (status == "busy") {
         deskText = "BUSY";
         deskColorName = "red";
+      } else if (status == "meeting") {
+        deskText = "MEETING";
+        deskColorName = "blue";
       } else if (status == "break") {
         deskText = "BREAK";
         deskColorName = "amber";
@@ -706,9 +713,11 @@ void handleFactoryReset() {
 #define C_YELLOW 0xFFE0
 #define C_RED    0xF800
 #define C_BLUE   0x041F
+#define C_CYAN   0x07FF
 #define C_AMBER  0xFD20
 #define C_CLAUDE 0xDBAA   // warm Claude-style orange accent (#D97757-ish)
 #define C_CLAY   0xCBED   // muted clay (#CD7F6A) — the pixel-creature body color
+#define MAC_USE_SMOOTH_PIE 1
 
 // Display clock/reset times in Thailand time. Pushed epochs are UTC; add the
 // offset only when formatting wall-clock text (durations/countdowns stay raw).
@@ -853,6 +862,99 @@ static void drawMetricRow(int y, const char *label, int pct, int barX, int barW)
   drawProgressBar(barX, y + 13, barW, 12, pct);
 }
 
+static void drawMacClock(int rightX, int y) {
+  unsigned long e = nowEpoch();
+  String t = e ? hhmmss(e + TZ_OFFSET) : String("--:--:--");
+  String z = String(TZ_LABEL);
+  int tzW = textWidth(z, 1);
+  printRight(rightX - tzW - 4, y, 1, t, C_WHITE, C_BLACK);
+  printRight(rightX, y, 1, z, C_GREEN, C_BLACK);
+}
+
+static String uptimeText() {
+  unsigned long totalHours = millis() / 3600000UL;
+  unsigned long days = totalHours / 24UL;
+  unsigned long hours = totalHours % 24UL;
+  return String("\x18") + String(days) + "d " + pad2(hours) + "h";
+}
+
+static uint16_t metricColor(int pct, bool invertColor) {
+  int colorPct = invertColor ? 100 - pct : pct;
+  if (colorPct < 0) colorPct = 0;
+  if (colorPct > 100) colorPct = 100;
+  return barColor(colorPct);
+}
+
+static void drawMacPieGauge(int cx, int cy, const char *label, int pct, bool invertColor) {
+  const int radius = 35;
+  int p = pct;
+  if (p < 0) p = 0;
+  if (p > 100) p = 100;
+
+  gfx->fillCircle(cx, cy, radius, C_LINE);
+  if (pct >= 0 && p > 0) {
+    uint16_t fillColor = metricColor(pct, invertColor);
+    if (p >= 100) {
+      gfx->fillCircle(cx, cy, radius, fillColor);
+    } else {
+      float sweep = (float)p * 3.6f;
+      if (sweep <= 90.0f) {
+        gfx->fillArc(cx, cy, radius, 0, 270, 270 + sweep, fillColor);
+      } else {
+        gfx->fillArc(cx, cy, radius, 0, 270, 359.9f, fillColor);
+        gfx->fillArc(cx, cy, radius, 0, 0, sweep - 90.0f, fillColor);
+      }
+    }
+  }
+
+  String value = pctText(pct);
+  uint8_t valueSize = value.length() > 3 ? 1 : 2;
+  uint16_t valueColor = pct < 0 ? C_GRAY : C_WHITE;
+  int valueW = textWidth(value, valueSize);
+  gfx->fillRoundRect(cx - valueW / 2 - 4, cy - 10, valueW + 8, 18, 3, C_BLACK);
+  gfx->setTextSize(valueSize);
+  gfx->setTextColor(valueColor, C_BLACK);
+  gfx->setCursor(cx - valueW / 2, cy - (valueSize == 2 ? 7 : 4));
+  gfx->print(value);
+
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_GRAY, C_BLACK);
+  gfx->setCursor(cx - textWidth(String(label), 1) / 2, cy + 43);
+  gfx->print(label);
+}
+
+static void drawMacLineGauge(int x, int y, const char *label, int pct, bool invertColor) {
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_GRAY, C_BLACK);
+  gfx->setCursor(x, y);
+  gfx->print(label);
+  printRight(x + 98, y, 1, pctText(pct), C_WHITE, C_BLACK);
+  gfx->fillRect(x, y + 13, 98, 10, C_BLACK);
+  gfx->drawRect(x, y + 13, 98, 10, C_LINE);
+  if (pct > 0) {
+    int p = pct > 100 ? 100 : pct;
+    gfx->fillRect(x + 2, y + 15, 94 * p / 100, 6, metricColor(pct, invertColor));
+  }
+}
+
+static void drawMacGauge(int cx, int cy, const char *label, int pct, bool invertColor) {
+#if MAC_USE_SMOOTH_PIE
+  drawMacPieGauge(cx, cy, label, pct, invertColor);
+#else
+  drawMacLineGauge(cx - 49, cy - 12, label, pct, invertColor);
+#endif
+}
+
+static String deskStatusQuote(const String &label) {
+  if (deskStatus == "custom") return "status set";
+  if (label == "CODING") return "ship the small thing";
+  if (label == "MEETING") return "listening mode";
+  if (label == "CLAUDE") return "assistant online";
+  if (label == "BUSY") return "deep focus";
+  if (label == "BREAK") return "back soon";
+  return "status set";
+}
+
 // Calendar date from a (TZ-adjusted) epoch — Howard Hinnant's civil_from_days.
 static void civilFromEpoch(unsigned long e, int &year, int &month, int &day) {
   long z = (long)(e / 86400UL) + 719468;
@@ -865,6 +967,56 @@ static void civilFromEpoch(unsigned long e, int &year, int &month, int &day) {
   day = (int)(doy - (153 * mp + 2) / 5 + 1);                 // [1, 31]
   month = (int)(mp < 10 ? mp + 3 : mp - 9);                  // [1, 12]
   year = (int)(y + (month <= 2));
+}
+
+// Typewriter frame for a desk label: types it in one char at a time, blinks a
+// cursor, holds the full word, then repeats. Applies to every desk word, not
+// just CODING. The frame is reset by drawDeskSign() restarting deskTypingStartMs.
+static String deskDisplayText(const String &label) {
+  unsigned long len = label.length();
+  if (len == 0) return label;
+
+  const unsigned long typeMs = 800UL;     // per-character reveal
+  const unsigned long holdMs = 30000UL;   // hold the full word before repeating
+  const unsigned long cycleMs = len * typeMs + holdMs;
+  unsigned long elapsed = (millis() - deskTypingStartMs) % cycleMs;
+  int chars = elapsed < len * typeMs ? (int)(elapsed / typeMs) + 1 : (int)len;
+  bool cursorOn = ((millis() / 500UL) % 2UL) == 0;
+  return label.substring(0, chars) + (cursorOn ? "|" : " ");
+}
+
+static void drawDeskStatusText(const String &label, uint16_t c) {
+  String shown = deskDisplayText(label);
+  if (shown == deskLastShown) return;      // unchanged frame — skip the redraw
+  deskLastShown = shown;
+
+  // Size from the full label (+cursor) so it stays constant through the type-in,
+  // and left-anchor at the final width so letters land in place instead of
+  // re-centering — and jittering — on every frame.
+  uint8_t textSize = (label.length() + 1 <= 8) ? 4 : 3;
+  int x = (240 - textWidth(label + "|", textSize)) / 2;
+  if (x < 0) x = 0;
+
+  // Pad to a constant-width field and print with an OPAQUE background instead of
+  // wiping the whole band first. Already-typed glyphs get overwritten with the
+  // same pixels (no visible flash), trailing/erased cells are cleared by the
+  // space glyphs' black background, so only the changed cell flips — smooth.
+  String field = shown;
+  while (field.length() < label.length() + 1) field += " ";
+  gfx->setTextSize(textSize);
+  gfx->setTextColor(c, C_BLACK);
+  gfx->setCursor(x, 88);
+  gfx->print(field);
+}
+
+static void drawDeskAnimatedStatus() {
+  // Custom text uses the tokenme.limited look: bold white on black, regardless
+  // of the ?color= param. Presets keep their status color.
+  uint16_t c = (deskStatus == "custom") ? C_WHITE : deskColor();
+  String label = deskText;
+  label.toUpperCase();
+  if (label.length() > 12) label = label.substring(0, 12);
+  drawDeskStatusText(label, c);
 }
 
 // "sat 20 jun" from a TZ-adjusted epoch.
@@ -954,8 +1106,15 @@ void tickDynamic() {
   if (e == 0) return;
 
   if (lcdScreen == SCREEN_DESK) {
-    gfx->fillRect(0, 176, 240, 10, C_BLACK);
-    printCentered(176, 1, hhmmss(e + TZ_OFFSET) + " " TZ_LABEL, C_WHITE, C_BLACK);
+    drawDeskAnimatedStatus();
+    gfx->fillRect(0, 168, 240, 18, C_BLACK);
+    printCentered(170, 2, hhmm(e + TZ_OFFSET), C_WHITE, C_BLACK);
+    return;
+  }
+
+  if (lcdScreen == SCREEN_MAC) {
+    gfx->fillRect(150, 9, 86, 10, C_BLACK);
+    drawMacClock(236, 9);
     return;
   }
 
@@ -972,36 +1131,33 @@ void drawMacMeter() {
   gfx->fillScreen(C_BLACK);
 
   gfx->setTextSize(1);
-  gfx->setTextColor(C_WHITE, C_BLACK);
-  gfx->setCursor(4, 9);
+  gfx->setTextColor(C_CLAUDE, C_BLACK);
+  gfx->setCursor(8, 9);
   gfx->print("MAC");
-  unsigned long e = nowEpoch();
-  printRight(236, 9, 1, e ? hhmmss(e + TZ_OFFSET) + " " TZ_LABEL
-                          : String("--:--:-- " TZ_LABEL), C_WHITE, C_BLACK);
+  drawMacClock(236, 9);
   gfx->drawFastHLine(0, 29, 240, C_LINE);
 
-  drawMetricRow(44, "CPU", macCpuPct, 72, 152);
-  drawMetricRow(82, "MEM", macMemPct, 72, 152);
-  drawMetricRow(120, "DISK", macDiskPct, 72, 152);
+  drawMacGauge(60, 74, "CPU", macCpuPct, false);
+  drawMacGauge(180, 74, "MEM", macMemPct, false);
+  drawMacGauge(60, 158, "DISK", macDiskPct, false);
+  drawMacGauge(180, 158, "BAT", macBatteryPct, true);
 
-  gfx->drawFastHLine(20, 158, 200, C_LINE);
+  gfx->drawFastHLine(0, 214, 240, C_LINE);
   gfx->setTextSize(1);
   gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor(12, 176);
-  gfx->print("BATTERY");
-  uint16_t bc = macBatteryPct < 0 ? C_GRAY : barColor(100 - macBatteryPct);
-  gfx->setTextSize(3);
-  gfx->setTextColor(bc, C_BLACK);
-  printRight(226, 166, 3, pctText(macBatteryPct), bc, C_BLACK);
-  drawIpPanel();
+  gfx->setCursor(8, 228);
+  gfx->print(uptimeText());
+  printRight(236, 228, 1, WiFi.localIP().toString(), C_CYAN, C_BLACK);
 }
 
 void drawDeskSign() {
   gfx->fillScreen(C_BLACK);
+  deskTypingStartMs = millis();
+  deskAnimLastMs = 0;
+  deskLastShown = "";             // force the first typing frame to paint
 
-  String label = deskText;
-  label.toUpperCase();
-  uint16_t c = deskColor();
+  // Custom text => the tokenme.limited monochrome look (white header + text).
+  uint16_t c = (deskStatus == "custom") ? C_WHITE : deskColor();
 
   gfx->fillRect(0, 0, 240, 34, c);
   gfx->setTextSize(2);
@@ -1009,19 +1165,16 @@ void drawDeskSign() {
   gfx->setCursor(14, 10);
   gfx->print("DESK");
 
-  uint8_t textSize = (label.length() <= 8) ? 4 : 3;
-  gfx->setTextSize(textSize);
-  gfx->setTextColor(c, C_BLACK);
-  int textW = textWidth(label, textSize);
-  gfx->setCursor((240 - textW) / 2, 88);
-  gfx->print(label);
+  drawDeskAnimatedStatus();
 
   gfx->drawFastHLine(42, 148, 156, C_LINE);
 
   unsigned long e = nowEpoch();
-  printCentered(176, 1, e ? hhmmss(e + TZ_OFFSET) + " " TZ_LABEL
-                          : String("--:--:-- " TZ_LABEL), C_WHITE, C_BLACK);
-  printCentered(205, 1, String("G4PYS"), C_GRAY, C_BLACK);
+  printCentered(170, 2, e ? hhmm(e + TZ_OFFSET) : String("--:--"), C_WHITE, C_BLACK);
+  String quoteLabel = deskText;
+  quoteLabel.toUpperCase();
+  if (quoteLabel.length() > 12) quoteLabel = quoteLabel.substring(0, 12);
+  printCentered(205, 1, deskStatusQuote(quoteLabel), C_GRAY, C_BLACK);
   drawIpPanel();
 }
 
@@ -1619,6 +1772,11 @@ void loop() {
     faceTick();    // self-paced animation; owns its own clock + redraws
     delay(2);      // keep the WiFi modem-sleep yield (see note below)
     return;
+  }
+
+  if (lcdScreen == SCREEN_DESK && millis() - deskAnimLastMs >= 120UL) {
+    deskAnimLastMs = millis();
+    drawDeskAnimatedStatus();
   }
 
   unsigned long e = nowEpoch();

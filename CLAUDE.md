@@ -127,8 +127,12 @@ grid renderer — a second PROGMEM base grid (`deskBase`) + a patch-based frame 
 (`WORK_FRAMES`) with no base shift, an extended `faceCellColor` palette (laptop/desk
 colors), all flash-resident so it adds ~0 IRAM. State is runtime-only (not persisted),
 defaults to idle, and is reported as `face` in `/usage.json` ·
-`GET|POST /desk?status=coding|busy|break` pushes a preset full-screen desk status sign;
-`/desk?text=<up-to-12-safe-chars>&color=green|red|amber|blue|white` pushes custom text/color ·
+`GET|POST /desk?status=coding|meeting|busy|break|claude` pushes a preset full-screen desk status sign
+(`coding` green, `meeting` blue, `busy` red, `break` amber, `claude` Claude-orange);
+`/desk?text=<up-to-12-safe-chars>&color=green|red|amber|blue|white|claude` pushes custom text;
+custom text always renders in the monochrome "tokenme.limited" style (bold white header + text on
+black, single centered line, typewriter + blinking cursor) and **ignores** the `color` param —
+the param is still accepted/persisted (dashboard dot) but does not tint the physical sign ·
 `/update` firmware-only OTA upload form.
 
 ## Commands
