@@ -166,10 +166,10 @@ def retry_after_seconds(headers):
         return RATE_LIMIT_BACKOFF
 
 
-def run_text(cmd):
+def run_text(cmd, timeout=5):
     try:
-        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.CalledProcessError):
+        return subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=timeout)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return ""
 
 
@@ -384,7 +384,7 @@ def push_mac_only(reason):
     r.update(mac_metrics())
     try:
         push(r)
-        print(f"mac-only: {reason}  cpu={r['cpu']}% mem={r['mem']}%")
+        print(f"mac-only: {reason}  cpu={r['cpu']}% mem={r['mem']}% bat={r['bat']}%")
     except Exception as push_error:
         print(f"device push failed: {push_error}", file=sys.stderr)
 
@@ -400,10 +400,10 @@ def main():
             push(r)
             if USAGE_SOURCE == "local":
                 print(f"session={r['s']}% ({r['st']} tok)  weekly={r['w']}% ({r['wt']} tok)  "
-                      f"cpu={r['cpu']}% mem={r['mem']}%")
+                      f"cpu={r['cpu']}% mem={r['mem']}% bat={r['bat']}%")
             else:
                 print(f"session={r['s']}%  weekly={r['w']}%  status={r['stat'] or '?'}  "
-                      f"cpu={r['cpu']}% mem={r['mem']}%")
+                      f"cpu={r['cpu']}% mem={r['mem']}% bat={r['bat']}%")
         except urllib.error.HTTPError as e:
             if e.code == 401:
                 print("401 Unauthorized: run any Claude Code command to refresh login.",

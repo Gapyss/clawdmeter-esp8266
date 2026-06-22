@@ -99,6 +99,18 @@ reset metadata, and simple Mac system metrics.
   default layout is tight at ~94% instruction RAM; `:mmu=4816` builds at ~69%
   instruction RAM with the same code. Adding `ICACHE_RAM_ATTR`/`IRAM_ATTR` code can
   still overflow `iram1`, so avoid new ISR/timer-heavy features.
+- **The MAC screen repaints in two phases — never `fillScreen` on a `/usage` push.**
+  The MAC view is a System-7 *About This Macintosh* window (menu bar + Finder clock,
+  pinstripe title bar, compact-Mac icon, and four 1-bit thermometer rows: CPU / Memory /
+  Disk / Battery, black fill that turns `C_RED` in the danger zone — CPU/MEM/DISK ≥ 85 %
+  or Battery ≤ 20 %, via `macMetricDanger`). A full `fillScreen` every 60 s flashes the
+  panel white and kills the glance-all-day feel, so `drawMacMeter()` is split: the static
+  chrome (`drawMacChrome`) is drawn **once** on switch-in, gated by the file-scope
+  `macChromeReady` flag (cleared to `false` whenever the screen is forced to MAC, line
+  ~618); every `/usage` push and the per-minute tick then run only `drawMacDynamic()`,
+  which repaints the clock, uptime, four bar interiors + numerals, and the stale `!`
+  marker with **opaque white-bg prints** (no clear-flash). Same discipline as the desk
+  canvas: don't reintroduce a `fillScreen`/full-body `fillRect` into the dynamic path.
 - **Use hex color literals (`0x0000`/`0xFFFF`), not Arduino_GFX `BLACK`/`WHITE`.**
   The named macros fail to resolve inside the non-capturing lambda used for
   `wm.setAPCallback`.

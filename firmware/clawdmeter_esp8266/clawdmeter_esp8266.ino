@@ -133,6 +133,8 @@ String deskLastShown = "";       // last drawn typing frame; skip redraw when un
 bool otaInProgress = false;     // true while /update is writing firmware
 bool otaUpdateOk = false;
 bool meterRedrawPending = false;
+bool macChromeReady = false;    // MAC screen chrome is static; dynamic pushes repaint only values
+bool claudeChromeReady = false; // CLAUDE screen chrome (cream card) is static; pushes repaint only values
 String otaError = "";
 String bootReason = "";         // why the chip last reset (captured once at boot)
 String bootInfo = "";           // detailed reset info (exception cause/stack on crash)
@@ -605,6 +607,8 @@ void handleMode() {
     else if (screen == "claude") nextScreen = SCREEN_CLAUDE;
     if (nextScreen != lcdScreen) {
       lcdScreen = nextScreen;
+      if (lcdScreen == SCREEN_MAC) macChromeReady = false;
+      if (lcdScreen == SCREEN_CLAUDE) claudeChromeReady = false;
       lastTickEpoch = 0;
       drawMeter();
     }
@@ -730,14 +734,17 @@ void handleFactoryReset() {
 #define C_AMBER  0xFD20
 #define C_CLAUDE 0xDBAA   // warm Claude-style orange accent (#D97757-ish)
 #define C_CLAY   0xCBED   // muted clay (#CD7F6A) — the pixel-creature body color
+// claude.ai brand palette for the SCREEN_CLAUDE redesign (warm paper aesthetic).
+#define C_CREAM  0xF7BD   // ivory paper background (#F5F4EE)
+#define C_INK    0x18E3   // warm near-black text / headline number (#1F1E1D-ish)
+#define C_TAN    0xEF5C   // bar track / soft fills (#EDE9E0)
+#define C_MUTE   0x8C92   // warm taupe for secondary labels on cream (#8A8578-ish)
 
 // Display clock/reset times in Thailand time. Pushed epochs are UTC; add the
 // offset only when formatting wall-clock text (durations/countdowns stay raw).
 #define TZ_OFFSET 25200UL   // Asia/Bangkok, UTC+7 (no DST)
 
 static const char *const DOW[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-static const char *const MON[12] = {"Jan","Feb","Mar","Apr","May","Jun",
-                                    "Jul","Aug","Sep","Oct","Nov","Dec"};
 
 static uint16_t barColor(int p) {
   if (p >= 90) return C_RED;
@@ -752,12 +759,6 @@ static uint16_t statusColor() {
   return C_RED;                         // rejected / blocked / queued ...
 }
 
-static uint16_t claudeUsageColor(int pct) {
-  if (pct >= 100) return C_CLAUDE;       // maxed rate: keep the Claude identity color
-  if (pct >= 60) return barColor(pct);
-  return C_CLAUDE;
-}
-
 static void drawClaudeStatusDot(bool force) {
   if (!unifiedStatus.length()) return;
 
@@ -769,13 +770,13 @@ static void drawClaudeStatusDot(bool force) {
   claudeStatusPulsePhase = phase;
 
   uint16_t c = statusColor();
-  gfx->fillRect(64, 4, 17, 18, C_BLACK);
+  gfx->fillRect(104, 7, 17, 18, C_CREAM);
   if (phase) {
     int r = 4 + phase;
-    gfx->drawCircle(72, 13, r, c);
-    if (phase < 3) gfx->drawCircle(72, 13, r + 1, c);
+    gfx->drawCircle(112, 16, r, c);
+    if (phase < 3) gfx->drawCircle(112, 16, r + 1, c);
   }
-  gfx->fillCircle(72, 13, 4, c);
+  gfx->fillCircle(112, 16, 4, c);
 }
 
 static int textWidth(const String &s, uint8_t size) {
@@ -803,21 +804,32 @@ static void drawProgressBar(int x, int y, int w, int h, int pct) {
   }
 }
 
+// Rounded "pill" usage bar: tan track with a coral fill (red in the danger zone).
+// Repaints the whole track each call so a shrinking % leaves no leftover fill.
 static void drawClaudeBar(int x, int y, int w, int h, int pct) {
-  gfx->fillRect(x, y, w, h, C_BLACK);
-  gfx->drawRect(x, y, w, h, C_LINE);
+  int rad = h / 2;
+  gfx->fillRoundRect(x, y, w, h, rad, C_TAN);     // track (also clears prior fill)
+  gfx->drawRoundRect(x, y, w, h, rad, C_MUTE);    // soft rim for definition
   if (pct > 0) {
     int p = pct > 100 ? 100 : pct;
-    uint16_t c = claudeUsageColor(pct);
-    gfx->fillRect(x + 2, y + 2, (w - 4) * p / 100, h - 4, c);
+    int fw = (w * p) / 100;
+    if (fw < h) fw = h;                            // keep the pill renderable at low %
+    uint16_t c = (pct >= 85) ? C_RED : C_CLAUDE;
+    gfx->fillRoundRect(x, y, fw, h, rad, c);
   }
 }
 
+// The Claude "burst" mark: eight coral spokes (long cardinals, shorter diagonals)
+// radiating from a small filled hub. Cardinals are double-struck for weight.
 static void drawClaudeIcon(int cx, int cy, uint16_t c) {
-  gfx->drawLine(cx - 7, cy, cx + 7, cy, c);
-  gfx->drawLine(cx, cy - 7, cx, cy + 7, c);
-  gfx->drawLine(cx - 5, cy - 5, cx + 5, cy + 5, c);
-  gfx->drawLine(cx - 5, cy + 5, cx + 5, cy - 5, c);
+  int r = 9;
+  int d = (r * 7) / 10;                            // diagonal reach
+  gfx->drawLine(cx - r, cy, cx + r, cy, c);
+  gfx->drawLine(cx, cy - r, cx, cy + r, c);
+  gfx->drawLine(cx - r, cy + 1, cx + r, cy + 1, c);
+  gfx->drawLine(cx + 1, cy - r, cx + 1, cy + r, c);
+  gfx->drawLine(cx - d, cy - d, cx + d, cy + d, c);
+  gfx->drawLine(cx - d, cy + d, cx + d, cy - d, c);
   gfx->fillCircle(cx, cy, 2, c);
 }
 
@@ -878,7 +890,8 @@ static void printRight(int rightX, int y, uint8_t size, const String &s,
 // Compact IP readout tucked into the bottom-right corner (size-1 gray text).
 // Callers fillScreen(C_BLACK) before this, so no background fill is needed.
 static void drawIpPanel() {
-  printRight(236, 230, 1, "IP " + WiFi.localIP().toString(), C_GRAY, C_BLACK);
+  gfx->fillRect(96, 224, 136, 9, C_CREAM);
+  printRight(232, 224, 1, "IP " + WiFi.localIP().toString(), C_MUTE, C_CREAM);
 }
 
 static void drawMetricRow(int y, const char *label, int pct, int barX, int barW) {
@@ -891,71 +904,126 @@ static void drawMetricRow(int y, const char *label, int pct, int barX, int barW)
   drawProgressBar(barX, y + 13, barW, 12, pct);
 }
 
-static void drawMacClock(int rightX, int y) {
+static void drawMacClock() {
   unsigned long e = nowEpoch();
   String t = e ? hhmm(e + TZ_OFFSET) : String("--:--");
-  printRight(rightX, y, 1, t, C_WHITE, C_BLACK);
+  gfx->fillRect(184, 2, 52, 10, C_WHITE);
+  printRight(236, 2, 1, t, C_BLACK, C_WHITE);
 }
 
-// Header "STALE" flag for the MAC screen: the cells freeze at their last pushed
-// values if the daemon stops, so flag it when the last /usage push is old (same
-// 120 s threshold the web dashboard dims at). Gated on lastUpdateMs so a fresh
-// boot with no data yet stays blank instead of reading STALE.
-static void drawMacStaleMarker() {
-  bool stale = (lastUpdateMs != 0) && (millis() - lastUpdateMs > 120000UL);
-  gfx->fillRect(60, 9, 120, 11, C_BLACK);
-  if (stale) printCentered(10, 1, String("STALE"), C_RED, C_BLACK);
-}
-
-static String uptimeText() {
+static String uptimePlainText() {
   unsigned long totalHours = millis() / 3600000UL;
   unsigned long days = totalHours / 24UL;
   unsigned long hours = totalHours % 24UL;
-  return String("\x18") + String(days) + "d " + pad2(hours) + "h";
+  return String(days) + "d " + pad2(hours) + "h";
 }
 
-static uint16_t metricColor(int pct, bool invertColor) {
-  int colorPct = invertColor ? 100 - pct : pct;
-  if (colorPct < 0) colorPct = 0;
-  if (colorPct > 100) colorPct = 100;
-  return barColor(colorPct);
+static void drawMacApple(int x, int y) {
+  gfx->fillCircle(x + 4, y + 6, 3, C_BLACK);
+  gfx->fillCircle(x + 8, y + 6, 3, C_BLACK);
+  gfx->fillCircle(x + 6, y + 9, 4, C_BLACK);
+  gfx->fillCircle(x + 10, y + 5, 2, C_WHITE);
+  gfx->drawLine(x + 6, y + 1, x + 9, y, C_BLACK);
 }
 
-static void drawMacUsageCell(int x, int y, int w, int h,
-                             const char *label, int pct, bool invertColor) {
-  gfx->fillRect(x + 1, y + 1, w - 2, h - 2, C_BLACK);
+static void drawCompactMacIcon(int x, int y) {
+  gfx->drawRect(x, y, 30, 34, C_BLACK);
+  gfx->drawRect(x + 4, y + 5, 22, 16, C_BLACK);
+  gfx->fillRect(x + 7, y + 8, 16, 10, C_BLACK);
+  gfx->drawFastHLine(x + 7, y + 25, 15, C_BLACK);
+  gfx->fillRect(x + 5, y + 32, 5, 2, C_BLACK);
+  gfx->fillRect(x + 20, y + 32, 5, 2, C_BLACK);
+}
 
+static void drawMacRowChrome(int y, const char *label) {
   gfx->setTextSize(1);
-  gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor(x + 10, y + 11);
+  gfx->setTextColor(C_BLACK, C_WHITE);
+  gfx->setCursor(18, y + 4);
   gfx->print(label);
+  gfx->drawRect(76, y, 96, 14, C_BLACK);
+}
 
-  printRight(x + w - 10, y + 11, 1, pctText(pct), C_WHITE, C_BLACK);
+static bool macMetricDanger(int pct, bool battery) {
+  if (pct < 0) return false;
+  return battery ? (pct <= 20) : (pct >= 85);
+}
 
-  const int barX = x + 10;
-  const int barY = y + 31;
-  const int barW = w - 20;
-  const int barH = 12;
-  gfx->drawRect(barX, barY, barW, barH, C_LINE);
+static void drawMacRowDynamic(int y, int pct, bool battery) {
+  const int barX = 76;
+  const int barY = y;
+  const int barW = 96;
+  const int barH = 14;
+  gfx->fillRect(barX + 2, barY + 2, barW - 4, barH - 4, C_WHITE);
   if (pct > 0) {
     int p = pct > 100 ? 100 : pct;
-    gfx->fillRect(barX + 2, barY + 2, (barW - 4) * p / 100, barH - 4,
-                  metricColor(pct, invertColor));
+    uint16_t fill = macMetricDanger(pct, battery) ? C_RED : C_BLACK;
+    gfx->fillRect(barX + 2, barY + 2, (barW - 4) * p / 100, barH - 4, fill);
   }
+
+  gfx->fillRect(178, y - 1, 50, 18, C_WHITE);
+  printRight(226, y, 2, pctText(pct), C_BLACK, C_WHITE);
 }
 
-// Calendar date from a (TZ-adjusted) epoch — Howard Hinnant's civil_from_days.
-static void civilFromEpoch(unsigned long e, int &year, int &month, int &day) {
-  long z = (long)(e / 86400UL) + 719468;
-  long era = (z >= 0 ? z : z - 146096) / 146097;
-  long doe = z - era * 146097;                                // [0, 146096]
-  long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-  long y = yoe + era * 400;
-  long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);         // [0, 365]
-  long mp = (5 * doy + 2) / 153;                              // [0, 11]
-  day = (int)(doy - (153 * mp + 2) / 5 + 1);                 // [1, 31]
-  month = (int)(mp < 10 ? mp + 3 : mp - 9);                  // [1, 12]
-  year = (int)(y + (month <= 2));
+static void drawMacStaleMarker() {
+  bool stale = (lastUpdateMs != 0) && (millis() - lastUpdateMs > 120000UL);
+  gfx->fillRect(220, 20, 9, 9, C_WHITE);
+  if (!stale) return;
+  gfx->drawRect(220, 20, 9, 9, C_BLACK);
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_BLACK, C_WHITE);
+  gfx->setCursor(223, 21);
+  gfx->print("!");
+}
+
+static void drawMacChrome() {
+  gfx->fillRect(0, 0, 240, 15, C_WHITE);
+  drawMacApple(4, 2);
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_BLACK, C_WHITE);
+  gfx->setCursor(20, 3);
+  gfx->print("Finder");
+  gfx->drawFastHLine(0, 14, 240, C_BLACK);
+
+  gfx->drawFastVLine(234, 18, 221, C_BLACK);
+  gfx->drawFastHLine(8, 238, 227, C_BLACK);
+  gfx->fillRect(6, 16, 228, 222, C_WHITE);
+  gfx->drawRect(6, 16, 228, 222, C_BLACK);
+
+  for (int y = 19; y <= 31; y += 2) gfx->drawFastHLine(8, y, 224, C_BLACK);
+  gfx->fillRect(91, 18, 120, 14, C_WHITE);
+  gfx->drawRect(13, 20, 9, 9, C_BLACK);
+  printCentered(21, 1, String("About This Macintosh"), C_BLACK, C_WHITE);
+  gfx->drawFastHLine(6, 34, 228, C_BLACK);
+
+  drawCompactMacIcon(24, 48);
+  gfx->setTextColor(C_BLACK, C_WHITE);
+  gfx->setTextSize(1);
+  gfx->setCursor(68, 52);
+  gfx->print("System Software 7.1");
+  gfx->setCursor(68, 66);
+  gfx->print("Clawdmeter");
+  gfx->drawFastHLine(16, 96, 208, C_BLACK);
+
+  drawMacRowChrome(116, "CPU");
+  drawMacRowChrome(140, "Memory");
+  drawMacRowChrome(164, "Disk");
+  drawMacRowChrome(188, "Battery");
+}
+
+static void drawMacDynamic() {
+  drawMacClock();
+
+  gfx->fillRect(68, 66, 132, 10, C_WHITE);
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_BLACK, C_WHITE);
+  gfx->setCursor(68, 66);
+  gfx->print("Clawdmeter up " + uptimePlainText());
+
+  drawMacStaleMarker();
+  drawMacRowDynamic(116, macCpuPct, false);
+  drawMacRowDynamic(140, macMemPct, false);
+  drawMacRowDynamic(164, macDiskPct, false);
+  drawMacRowDynamic(188, macBatteryPct, true);
 }
 
 // Typewriter frame for a desk label: types it in one char at a time, blinks a
@@ -1018,82 +1086,72 @@ static void drawDeskAnimatedStatus() {
   drawDeskStatusText(label);
 }
 
-// "sat 20 jun" from a TZ-adjusted epoch.
-static String dateLine(unsigned long e) {
-  int yr, mo, da;
-  civilFromEpoch(e, yr, mo, da);
-  String s = String(DOW[(int)((e / 86400UL + 4) % 7)]) + " " + String(da) + " " + MON[mo - 1];
-  s.toLowerCase();
-  return s;
-}
+// Static chrome for the cream "claude.ai" card. Drawn once on switch-in (gated by
+// claudeChromeReady); the per-push dynamic pass repaints only the values in-place,
+// so there is no fillScreen flash every 60 s (same discipline as the MAC screen).
+static void drawClaudeChrome() {
+  // Soft rounded card edge (2 px) on the cream field.
+  gfx->drawRoundRect(2, 2, 236, 236, 12, C_MUTE);
+  gfx->drawRoundRect(3, 3, 234, 234, 11, C_MUTE);
 
-// Big HH:MM + date on the wait screen (the only parts that change each minute).
-static void drawWaitingTime() {
-  unsigned long e = nowEpoch();
-  unsigned long le = e ? e + TZ_OFFSET : 0;        // Thailand time
-  String t = e ? hhmm(le) : String("--:--");
-  gfx->fillRect(0, 40, 240, 40, C_BLACK);
-  gfx->setTextSize(4);
-  gfx->setTextColor(C_WHITE, C_BLACK);
-  gfx->setCursor((240 - (int)t.length() * 24) / 2, 44);
-  gfx->print(t);
-
-  String d = e ? dateLine(le) : String("--");
-  gfx->fillRect(0, 90, 240, 18, C_BLACK);
+  // Header: Claude burst mark + wordmark, then a hairline divider rule.
+  drawClaudeIcon(16, 16, C_CLAUDE);
   gfx->setTextSize(2);
-  gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor((240 - (int)d.length() * 12) / 2, 92);
-  gfx->print(d);
+  gfx->setTextColor(C_INK, C_CREAM);
+  gfx->setCursor(32, 9);
+  gfx->print("Claude");
+  gfx->drawFastHLine(12, 33, 216, C_TAN);
+
+  // Static block labels (the values themselves are painted by the dynamic pass).
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_MUTE, C_CREAM);
+  gfx->setCursor(20, 46);
+  gfx->print("Session 5h");
+
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_INK, C_CREAM);
+  gfx->setCursor(20, 158);
+  gfx->print("Weekly");
 }
 
-static void drawWaiting() {
-  drawWaitingTime();
-  gfx->drawFastHLine(36, 124, 168, C_LINE);
-  printCentered(140, 2, String("waiting for data"), C_WHITE, C_BLACK);
-  printCentered(174, 1, String("G4PYS"), C_GRAY, C_BLACK);
-  drawIpPanel();
-}
-
+// Dynamic session block: binding accent, headline %, pill bar, reset + countdown.
 static void drawClaudeHero() {
-  uint16_t c = claudeUsageColor(sessionPct);
-  if (bindingLimit == 1) gfx->fillRect(0, 38, 5, 104, C_AMBER);
+  // Binding-limit accent: a coral tick beside the active block's label.
+  gfx->fillRect(12, 45, 3, 9, bindingLimit == 1 ? C_CLAUDE : C_CREAM);
 
+  // Headline percentage in dark ink (coral is reserved for accents); red in danger.
+  uint16_t bigC = (sessionPct >= 85) ? C_RED : C_INK;
+  gfx->fillRect(8, 60, 224, 38, C_CREAM);              // clear band (width changes)
+  printCentered(63, 5, pctText(sessionPct), bigC, C_CREAM);
+
+  drawClaudeBar(16, 110, 208, 16, sessionPct);
+
+  // Reset time (fixed width) + live countdown (variable width → cleared).
   gfx->setTextSize(1);
-  gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor(12, 40);
-  gfx->print("SESSION 5h");
-
-  String pct = pctText(sessionPct);
-  gfx->setTextSize(5);
-  gfx->setTextColor(c, C_BLACK);
-  gfx->setCursor((240 - textWidth(pct, 5)) / 2, 57);
-  gfx->print(pct);
-
-  drawClaudeBar(16, 112, 208, 18, sessionPct);
-
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor(12, 138);
+  gfx->setTextColor(C_MUTE, C_CREAM);
+  gfx->setCursor(20, 136);
   if (sessReset == 0) gfx->print("reset --:--");
   else gfx->print("reset " + hhmm(sessReset + TZ_OFFSET));
 
   String cd = (sessReset && nowEpoch()) ? countdown((long)sessReset - (long)nowEpoch()) : "T--";
-  printRight(228, 138, 1, cd, C_WHITE, C_BLACK);
+  gfx->fillRect(176, 136, 48, 8, C_CREAM);
+  printRight(224, 136, 1, cd, C_INK, C_CREAM);
 }
 
+// Dynamic weekly block: binding accent, %, pill bar, reset day/time.
 static void drawClaudeWeekly() {
-  if (bindingLimit == 2) gfx->fillRect(0, 161, 5, 36, C_AMBER);
+  gfx->fillRect(12, 160, 3, 11, bindingLimit == 2 ? C_CLAUDE : C_CREAM);
 
-  gfx->setTextSize(2);
-  gfx->setTextColor(C_WHITE, C_BLACK);
-  gfx->setCursor(12, 160);
-  gfx->print("WEEKLY");
-  printRight(228, 160, 2, pctText(weeklyPct), C_WHITE, C_BLACK);
-  drawClaudeBar(16, 184, 208, 12, weeklyPct);
+  uint16_t wC = (weeklyPct >= 85) ? C_RED : C_INK;
+  gfx->fillRect(150, 158, 74, 14, C_CREAM);           // clear region (width changes)
+  printRight(224, 158, 2, pctText(weeklyPct), wC, C_CREAM);
 
+  drawClaudeBar(16, 182, 208, 12, weeklyPct);
+
+  gfx->fillRect(20, 202, 176, 8, C_CREAM);
   gfx->setTextSize(1);
-  gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor(12, 204);
+  gfx->setTextColor(C_MUTE, C_CREAM);
+  gfx->setCursor(20, 202);
   if (weekReset == 0) gfx->print("reset --");
   else gfx->print("reset " + dowName(weekReset + TZ_OFFSET) + " " + hhmm(weekReset + TZ_OFFSET));
 }
@@ -1110,47 +1168,27 @@ void tickDynamic() {
   }
 
   if (lcdScreen == SCREEN_MAC) {
-    gfx->fillRect(190, 9, 38, 10, C_BLACK);
-    drawMacClock(228, 10);
-    drawMacStaleMarker();
+    drawMacDynamic();
     return;
   }
 
-  gfx->fillRect(150, 9, 86, 10, C_BLACK);
-  printRight(236, 9, 1, hhmmss(e + TZ_OFFSET), C_WHITE, C_BLACK);
+  // SCREEN_CLAUDE: cream header clock + session countdown, opaque cream-bg prints.
+  gfx->fillRect(184, 12, 48, 8, C_CREAM);
+  printRight(232, 12, 1, hhmmss(e + TZ_OFFSET), C_INK, C_CREAM);
 
-  if (lcdScreen == SCREEN_CLAUDE && sessReset) {
-    gfx->fillRect(154, 138, 74, 10, C_BLACK);
-    printRight(228, 138, 1, countdown((long)sessReset - (long)e), C_WHITE, C_BLACK);
+  if (sessReset) {
+    gfx->fillRect(176, 136, 48, 8, C_CREAM);
+    printRight(224, 136, 1, countdown((long)sessReset - (long)e), C_INK, C_CREAM);
   }
 }
 
 void drawMacMeter() {
-  gfx->fillScreen(C_BLACK);
-
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_CLAUDE, C_BLACK);
-  gfx->setCursor(12, 10);
-  gfx->print("MAC");
-  drawMacClock(228, 10);
-  drawMacStaleMarker();
-
-  gfx->drawRect(4, 4, 232, 232, C_LINE);
-  gfx->drawFastHLine(4, 30, 232, C_LINE);
-  gfx->drawFastHLine(4, 106, 232, C_LINE);
-  gfx->drawFastHLine(4, 182, 232, C_LINE);
-  gfx->drawFastVLine(120, 30, 152, C_LINE);
-
-  drawMacUsageCell(4, 30, 116, 76, "CPU", macCpuPct, false);
-  drawMacUsageCell(120, 30, 116, 76, "MEM", macMemPct, false);
-  drawMacUsageCell(4, 106, 116, 76, "DISK", macDiskPct, false);
-  drawMacUsageCell(120, 106, 116, 76, "BAT", macBatteryPct, true);
-
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_GRAY, C_BLACK);
-  gfx->setCursor(12, 202);
-  gfx->print(String("dev ") + uptimeText());
-  printRight(228, 202, 1, WiFi.localIP().toString(), C_CYAN, C_BLACK);
+  if (!macChromeReady) {
+    gfx->fillScreen(C_WHITE);
+    drawMacChrome();
+    macChromeReady = true;
+  }
+  drawMacDynamic();
 }
 
 // One swatch of the MacPaint pattern palette: a small black-on-white fill drawn
@@ -1299,7 +1337,11 @@ static const uint8_t CELL_EMPTY = 0, CELL_BODY = 1, CELL_EYE = 2,
                      // The "monk" meditation scene: an orange Claude sunburst face
                      // (CELL_SPARK) over a static white stone robe (CELL_ROBE), with
                      // grey fold/edge shadows (CELL_ROBE_SHADE) that give it shape.
-                     CELL_SPARK = 10, CELL_ROBE = 11, CELL_ROBE_SHADE = 12;
+                     // CELL_ROBE_EDGE is the ink silhouette outline auto-generated
+                     // around the white robe so it separates from the cream paper
+                     // (the white robe is invisible on cream without it).
+                     CELL_SPARK = 10, CELL_ROBE = 11, CELL_ROBE_SHADE = 12,
+                     CELL_ROBE_EDGE = 13;
 // RGB565 for the desk-scene cells (converted from the reference #hex palette).
 #define C_HP_LIGHT  0xD6FC   // headphone light  #d4dde2
 #define C_HP_SHADOW 0x8C93   // headphone shadow #8a9199
@@ -1670,11 +1712,14 @@ static FaceExpr faceComputeExpr() {
   return e;
 }
 
-// Map a grid cell to a panel color. Eyes are near-black (#0f0f0f in the ref), so
-// they read as holes punched in the body -> drawing them as C_BLACK is faithful.
+// Map a grid cell to a panel color. The face screen sits on the warm ivory Claude
+// paper (C_CREAM), so EMPTY paints cream (the background) and the eye is warm ink
+// (reads as a hole punched in the clay body, the same way it read as black on the
+// old black field).
 static uint16_t faceCellColor(uint8_t v, uint16_t body) {
   switch (v) {
     case CELL_BODY:      return body;        // mood color (clay)
+    case CELL_EYE:       return C_INK;       // eye-hole (warm near-black on clay)
     case CELL_HP_LIGHT:  return C_HP_LIGHT;
     case CELL_HP_SHADOW: return C_HP_SHADOW;
     case CELL_SCREEN:    return C_SCREEN;
@@ -1685,7 +1730,8 @@ static uint16_t faceCellColor(uint8_t v, uint16_t body) {
     case CELL_SPARK:     return C_CLAUDE;    // monk sunburst face (orange)
     case CELL_ROBE:      return C_WHITE;     // monk stone robe (static, not mood-tinted)
     case CELL_ROBE_SHADE: return C_GRAY;     // robe fold/edge shadow (gives shape)
-    default:             return C_BLACK;     // empty + eye (holes read as black)
+    case CELL_ROBE_EDGE: return C_INK;       // ink silhouette outline on cream
+    default:             return C_CREAM;     // empty == the ivory paper background
   }
 }
 
@@ -1707,6 +1753,29 @@ static void faceBuildGrid(uint8_t out[F_N][F_N], const FaceFrame &f,
   }
   for (uint8_t i = 0; i < f.nops; i++)
     out[f.ops[i].r][f.ops[i].c] = f.ops[i].v;
+
+  // Monk scene only: auto-outline the white stone robe with an ink silhouette so it
+  // separates from the cream paper (pure-white robe is invisible on cream). Any empty
+  // cell touching a robe cell (8-neighbour) becomes CELL_ROBE_EDGE. Safe in-place:
+  // edge cells are never CELL_ROBE/_SHADE, so they can't seed further outline, and the
+  // orange burst (CELL_SPARK) isn't robe, so its spoke tips against cream stay clean.
+  if (faceMode == FACE_MODE_MONK) {
+    for (int r = 0; r < F_N; r++) {
+      for (int c = 0; c < F_N; c++) {
+        if (out[r][c] != CELL_EMPTY) continue;
+        bool near = false;
+        for (int dr2 = -1; dr2 <= 1 && !near; dr2++) {
+          for (int dc2 = -1; dc2 <= 1; dc2++) {
+            int rr = r + dr2, cc = c + dc2;
+            if (rr < 0 || rr >= F_N || cc < 0 || cc >= F_N) continue;
+            uint8_t nv = out[rr][cc];
+            if (nv == CELL_ROBE || nv == CELL_ROBE_SHADE) { near = true; break; }
+          }
+        }
+        if (near) out[r][c] = CELL_ROBE_EDGE;
+      }
+    }
+  }
 }
 
 // The base grid for the active scene.
@@ -1721,7 +1790,7 @@ static const uint8_t (*faceActiveBase())[F_N] {
 // frame step paints just the handful of moved eye/edge cells.
 static void faceRender(uint16_t body, bool force) {
   // Confined to the animation window: this both centres the creature and keeps
-  // its (black) empty cells from painting over the header/footer chrome.
+  // its (cream) empty cells from painting over the header/footer chrome.
   for (int r = FACE_R0; r <= FACE_R1; r++) {
     for (int c = FACE_C0; c <= FACE_C1; c++) {
       uint8_t v = faceGrid[r][c];
@@ -1734,42 +1803,45 @@ static void faceRender(uint16_t body, bool force) {
   }
 }
 
-// Static frame, drawn once per faceBegin: the Claude-orange bezel/safe-area, the
-// header and divider rules, and the small-caps footer sub-labels. The per-second
-// status redraw never touches any of this, so the sub-labels can't be ghosted by
-// the clock tick.
+// Static frame, drawn once per faceBegin: the Claude-brand chrome on the ivory
+// paper — a soft rounded card edge, the burst mark + "Claude" wordmark header (same
+// as the hero screen, so the companion reads as one family), a hairline divider, and
+// the small-caps footer sub-labels. The per-second status redraw never touches any of
+// this, so the sub-labels can't be ghosted by the clock tick.
 static void faceDrawChrome() {
-  gfx->drawRoundRect(1, 1, 238, 238, 8, C_CLAUDE);   // bezel / safe area
-  gfx->drawFastHLine(8, 31, 224, C_CLAUDE);          // header rule
-  gfx->drawFastHLine(8, 190, 224, C_CLAUDE);         // creature | data divider
+  gfx->drawRoundRect(2, 2, 236, 236, 12, C_MUTE);    // soft rounded card edge
+  gfx->drawRoundRect(3, 3, 234, 234, 11, C_MUTE);
+  drawClaudeIcon(16, 16, C_CLAUDE);                  // burst mark
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_INK, C_CREAM);
+  gfx->setCursor(32, 9); gfx->print("Claude");       // wordmark
+  gfx->drawFastHLine(12, 33, 216, C_TAN);            // header rule
+  gfx->drawFastHLine(12, 190, 216, C_TAN);           // creature | data divider
   gfx->setTextSize(1);
-  gfx->setTextColor(C_CLAUDE, C_BLACK);
-  gfx->setCursor(14, 197); gfx->print("MOOD");
-  printRight(226, 197, 1, "TIME", C_CLAUDE, C_BLACK);
+  gfx->setTextColor(C_MUTE, C_CREAM);
+  gfx->setCursor(14, 194); gfx->print("MOOD");       // footer sub-labels
+  printRight(226, 194, 1, "TIME", C_MUTE, C_CREAM);
 }
 
-// Dynamic readout. Header: three state dots (session / weekly / server-status
-// health) plus a compact live %-label — distinct from the footer mood so the two
-// zones don't say the same thing. Footer: mood value (left, spark colour) and the
-// clock (right, white), each cleared in its own rectangle so a variable-length
-// mood (SLEEPY=6 vs HAPPY=5) leaves no ghost and the sub-labels survive.
+// Dynamic footer readout on the ivory paper. Mood value (left, spark colour), the
+// live S/W usage % (centre, muted — supplements the dedicated Claude screen), and the
+// clock (right, ink). Each is cleared in its own cream rectangle so a variable-length
+// mood (SLEEPY=6 vs HAPPY=5) or usage width leaves no ghost and the static sub-labels
+// survive.
 static void faceDrawStatus(const FaceExpr &e) {
   int sc = sessionPct, wc = weeklyPct;
-  gfx->fillCircle(16, 18, 4, C_CLAUDE);   // always Claude orange, never percent-tinted
-  gfx->fillCircle(30, 18, 4, C_CLAUDE);
-  gfx->fillCircle(44, 18, 4, C_CLAUDE);
-  String hdr = "S" + pctText(sc) + " W" + pctText(wc);
-  gfx->fillRect(96, 11, 138, 9, C_BLACK);            // clear old label
-  printRight(232, 12, 1, hdr, C_CLAUDE, C_BLACK);
+  String usage = "S" + pctText(sc) + " W" + pctText(wc);
+  gfx->fillRect(84, 193, 92, 9, C_CREAM);            // clear old usage label (centred band)
+  printCentered(194, 1, usage, C_MUTE, C_CREAM);
 
   unsigned long ee = nowEpoch();
   String clk = ee ? hhmmss(ee + TZ_OFFSET) : String("--:--:--");
-  gfx->fillRect(12, 208, 96, 16, C_BLACK);           // clear old mood value
+  gfx->fillRect(12, 205, 96, 16, C_CREAM);           // clear old mood value
   gfx->setTextSize(2);
-  gfx->setTextColor(e.spark, C_BLACK);
-  gfx->setCursor(14, 209); gfx->print(e.mood);
-  gfx->fillRect(130, 208, 104, 16, C_BLACK);         // clear old clock
-  printRight(232, 209, 2, clk, C_WHITE, C_BLACK);
+  gfx->setTextColor(e.spark, C_CREAM);
+  gfx->setCursor(14, 206); gfx->print(e.mood);
+  gfx->fillRect(130, 205, 104, 16, C_CREAM);         // clear old clock
+  printRight(232, 206, 2, clk, C_INK, C_CREAM);
 }
 
 static void faceBegin() {
@@ -1778,7 +1850,7 @@ static void faceBegin() {
   faceFrameStart = millis();
   FaceExpr e = faceComputeExpr();
   faceBody = e.body; faceMoodId = e.id;
-  gfx->fillScreen(C_BLACK);
+  gfx->fillScreen(C_CREAM);   // ivory Claude paper (only fillScreen on this screen)
   faceDrawChrome();
   faceBuildGrid(faceGrid, faceFrameList()[0], faceActiveBase());
   memset(facePrev, 0xFF, sizeof(facePrev));   // sentinel -> first render draws all
@@ -1822,30 +1894,32 @@ void drawMeter() {
   if (lcdScreen == SCREEN_DESK) { drawDeskSign(); return; }
   if (lcdScreen == SCREEN_FACE) { faceBegin(); return; }
 
-  gfx->fillScreen(C_BLACK);
+  // Two-phase repaint: draw the cream card chrome once on switch-in, then only
+  // repaint values on every /usage push (no fillScreen flash). The no-data case
+  // (Claude down) renders the same card with "--" placeholders, not a black screen.
+  if (!claudeChromeReady) {
+    gfx->fillScreen(C_CREAM);
+    drawClaudeChrome();
+    claudeChromeReady = true;
+  }
 
-  if (sessionPct < 0 && weeklyPct < 0) { drawWaiting(); return; }
-
-  // Status band: Claude spark icon + title + API state + Thailand-time clock.
-  drawClaudeIcon(10, 13, C_CLAUDE);
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_CLAUDE, C_BLACK);
-  gfx->setCursor(24, 9);
-  gfx->print("CLAUDE");
+  // Header status: API state word + pulsing dot, then the Thailand-time clock.
   if (unifiedStatus.length()) {
     uint16_t c = statusColor();
     drawClaudeStatusDot(true);
     String label = unifiedStatus;
     label.toUpperCase();
-    if (label.length() > 10) label = label.substring(0, 10);
-    gfx->setTextColor(c, C_BLACK);
-    gfx->setCursor(82, 9);
+    if (label.length() > 8) label = label.substring(0, 8);
+    gfx->fillRect(122, 12, 56, 8, C_CREAM);
+    gfx->setTextSize(1);
+    gfx->setTextColor(c, C_CREAM);
+    gfx->setCursor(124, 12);
     gfx->print(label);
   }
   unsigned long e = nowEpoch();
-  printRight(236, 9, 1, e ? hhmmss(e + TZ_OFFSET) : String("--:--:--"),
-             C_WHITE, C_BLACK);
-  gfx->drawFastHLine(0, 29, 240, C_CLAUDE);
+  gfx->fillRect(184, 12, 48, 8, C_CREAM);
+  printRight(232, 12, 1, e ? hhmmss(e + TZ_OFFSET) : String("--:--:--"),
+             C_INK, C_CREAM);
 
   drawClaudeHero();
   drawClaudeWeekly();
@@ -2049,18 +2123,13 @@ void loop() {
     drawDeskAnimatedStatus();
   }
 
-  if (lcdScreen == SCREEN_CLAUDE && unifiedStatus.length() &&
-      sessionPct >= 0 && weeklyPct >= 0) {
+  if (lcdScreen == SCREEN_CLAUDE && unifiedStatus.length()) {
     drawClaudeStatusDot(false);
   }
 
   unsigned long e = nowEpoch();
   if (e != 0) {
-    if (lcdScreen == SCREEN_CLAUDE && sessionPct < 0 && weeklyPct < 0) {
-      // Wait screen: refresh the big clock/date once a minute.
-      unsigned long minute = e / 60UL;
-      if (minute != lastTickEpoch) { lastTickEpoch = minute; drawWaitingTime(); }
-    } else if (lcdScreen == SCREEN_MAC) {
+    if (lcdScreen == SCREEN_MAC) {
       // MAC clock is HH:MM, so refresh it once a minute. Daemon /usage pushes
       // still trigger a full redraw through meterRedrawPending above.
       unsigned long minute = e / 60UL;
