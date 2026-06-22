@@ -134,12 +134,19 @@ reuse the same grid renderer: `deskBase` + `WORK_FRAMES` for coding, `SLEEP_FRAM
 over the idle base for sleep, and `monkBase` + `MONK_FRAMES` for the monk. State is
 runtime-only (not persisted), defaults to idle, and is reported as `face` in
 `/usage.json` ·
-`GET|POST /desk?status=coding|meeting|busy|break|claude` pushes a preset full-screen desk status sign
-(`coding` green, `meeting` blue, `busy` red, `break` amber, `claude` Claude-orange);
-`/desk?text=<up-to-12-safe-chars>&color=green|red|amber|blue|white|claude` pushes custom text;
-custom text always renders in the monochrome "tokenme.limited" style (bold white header + text on
-black, single centered line, typewriter + blinking cursor) and **ignores** the `color` param —
-the param is still accepted/persisted (dashboard dot) but does not tint the physical sign ·
+`GET|POST /desk?status=coding|meeting|busy|break|claude` pushes a preset desk status word;
+`/desk?text=<up-to-12-safe-chars>&color=green|red|amber|blue|white|claude` pushes custom text.
+The physical desk screen is a **classic MacPaint window** (`drawDeskSign`): a white menu bar
+(`File Edit Goodies Font FontSize Style`), a left 2×8 tool-glyph palette, an "untitled"
+document window, and a bottom pattern-swatch strip. The status word — preset or custom — is
+**typed in black ink on the white canvas** (current default GFX font, single centered line,
+typewriter + blinking cursor via `deskDisplayText`; size auto-drops 4→3→2 so 12 chars fit).
+The chrome is drawn **once** by `drawDeskSign` on switch-in; only the canvas text region is
+repainted on the ~120 ms animation tick (opaque white-bg in-place print, no per-frame clear),
+so don't reintroduce a full canvas `fillRect` in that path. The `color` param (and the preset
+status color) is accepted/persisted only to tint the **dashboard dot** — it does **not** tint
+the physical sign, which is monochrome black-on-white. No clock/quote/IP on this screen
+(device stays reachable at `clawdmeter.local`) ·
 `/update` firmware-only OTA upload form.
 
 ## Commands

@@ -778,15 +778,6 @@ static void drawClaudeStatusDot(bool force) {
   gfx->fillCircle(72, 13, 4, c);
 }
 
-static uint16_t deskColor() {
-  if (deskColorName == "red") return C_RED;
-  if (deskColorName == "amber") return C_AMBER;
-  if (deskColorName == "blue") return C_BLUE;
-  if (deskColorName == "white") return C_WHITE;
-  if (deskColorName == "claude") return C_CLAUDE;
-  return C_GREEN;
-}
-
 static int textWidth(const String &s, uint8_t size) {
   return (int)s.length() * 6 * size;
 }
@@ -953,16 +944,6 @@ static void drawMacUsageCell(int x, int y, int w, int h,
   }
 }
 
-static String deskStatusQuote(const String &label) {
-  if (deskStatus == "custom") return "status set";
-  if (label == "CODING") return "ship the small thing";
-  if (label == "MEETING") return "listening mode";
-  if (label == "CLAUDE") return "assistant online";
-  if (label == "BUSY") return "deep focus";
-  if (label == "BREAK") return "back soon";
-  return "status set";
-}
-
 // Calendar date from a (TZ-adjusted) epoch — Howard Hinnant's civil_from_days.
 static void civilFromEpoch(unsigned long e, int &year, int &month, int &day) {
   long z = (long)(e / 86400UL) + 719468;
@@ -993,38 +974,48 @@ static String deskDisplayText(const String &label) {
   return label.substring(0, chars) + (cursorOn ? "|" : " ");
 }
 
-static void drawDeskStatusText(const String &label, uint16_t c) {
+// The MacPaint window "canvas": the white drawing area the typed text lives in.
+// (x..x+w, y..y+h) = 39..238 wide, 29..199 tall. drawDeskSign fills it white once.
+#define DESK_CANVAS_X 39
+#define DESK_CANVAS_Y 29
+#define DESK_CANVAS_W 200
+#define DESK_CANVAS_H 171
+
+static void drawDeskStatusText(const String &label) {
   String shown = deskDisplayText(label);
   if (shown == deskLastShown) return;      // unchanged frame — skip the redraw
   deskLastShown = shown;
 
   // Size from the full label (+cursor) so it stays constant through the type-in,
-  // and left-anchor at the final width so letters land in place instead of
-  // re-centering — and jittering — on every frame.
-  uint8_t textSize = (label.length() + 1 <= 8) ? 4 : 3;
-  int x = (240 - textWidth(label + "|", textSize)) / 2;
-  if (x < 0) x = 0;
+  // and center on the canvas at the final width so letters land in place instead
+  // of re-centering — and jittering — on every frame. Drop a size if the word
+  // won't fit the canvas (12 chars only fit at size 2).
+  int full = (int)label.length() + 1;
+  uint8_t textSize = (full * 24 <= DESK_CANVAS_W - 8) ? 4
+                   : (full * 18 <= DESK_CANVAS_W - 8) ? 3 : 2;
+  int x = DESK_CANVAS_X + (DESK_CANVAS_W - textWidth(label + "|", textSize)) / 2;
+  if (x < DESK_CANVAS_X + 1) x = DESK_CANVAS_X + 1;
+  int y = DESK_CANVAS_Y + (DESK_CANVAS_H - 8 * textSize) / 2;
 
-  // Pad to a constant-width field and print with an OPAQUE background instead of
-  // wiping the whole band first. Already-typed glyphs get overwritten with the
-  // same pixels (no visible flash), trailing/erased cells are cleared by the
-  // space glyphs' black background, so only the changed cell flips — smooth.
+  // Pad to a constant-width field and print with an OPAQUE white background
+  // instead of wiping the canvas first. Already-typed glyphs get overwritten
+  // with the same pixels (no visible flash), trailing/erased cells are cleared
+  // by the space glyphs' white background, so only the changed cell flips.
   String field = shown;
   while (field.length() < label.length() + 1) field += " ";
   gfx->setTextSize(textSize);
-  gfx->setTextColor(c, C_BLACK);
-  gfx->setCursor(x, 88);
+  gfx->setTextColor(C_BLACK, C_WHITE);     // black ink on the white canvas
+  gfx->setCursor(x, y);
   gfx->print(field);
 }
 
 static void drawDeskAnimatedStatus() {
-  // Custom text uses the tokenme.limited look: bold white on black, regardless
-  // of the ?color= param. Presets keep their status color.
-  uint16_t c = (deskStatus == "custom") ? C_WHITE : deskColor();
+  // MacPaint is black ink on a white canvas — presets and custom text alike.
+  // (Preset/custom color still drives the dashboard dot via deskColorName.)
   String label = deskText;
   label.toUpperCase();
   if (label.length() > 12) label = label.substring(0, 12);
-  drawDeskStatusText(label, c);
+  drawDeskStatusText(label);
 }
 
 // "sat 20 jun" from a TZ-adjusted epoch.
@@ -1114,9 +1105,7 @@ void tickDynamic() {
   if (e == 0) return;
 
   if (lcdScreen == SCREEN_DESK) {
-    drawDeskAnimatedStatus();
-    gfx->fillRect(0, 168, 240, 18, C_BLACK);
-    printCentered(170, 2, hhmm(e + TZ_OFFSET), C_WHITE, C_BLACK);
+    drawDeskAnimatedStatus();   // no clock on the MacPaint canvas; typewriter only
     return;
   }
 
@@ -1164,32 +1153,130 @@ void drawMacMeter() {
   printRight(228, 202, 1, WiFi.localIP().toString(), C_CYAN, C_BLACK);
 }
 
+// One swatch of the MacPaint pattern palette: a small black-on-white fill drawn
+// pixel by pixel. Static (draw-once), so the per-pixel cost doesn't matter.
+static void drawDeskPattern(int x, int y, int w, int h, int type) {
+  switch (type & 7) {
+    case 0: break;                                   // white / empty
+    case 1: gfx->fillRect(x, y, w, h, C_BLACK); break;  // solid
+    default:
+      for (int yy = 0; yy < h; yy++)
+        for (int xx = 0; xx < w; xx++) {
+          bool on = false;
+          switch (type & 7) {
+            case 2: on = (xx + yy) & 1; break;       // checker
+            case 3: on = (yy & 1) == 0; break;       // horizontal lines
+            case 4: on = (xx & 1) == 0; break;       // vertical lines
+            case 5: on = (xx % 3 == 0) && (yy % 3 == 0); break;  // sparse dots
+            case 6: on = (xx + yy) % 3 == 0; break;  // diagonal
+            case 7: on = (xx & 1) == 0 && (yy & 1) == 0; break;  // grid
+          }
+          if (on) gfx->drawPixel(x + xx, y + yy, C_BLACK);
+        }
+  }
+}
+
+// A tiny simplified MacPaint tool glyph centered in its cell.
+static void drawDeskToolGlyph(int cx, int cy, int i) {
+  switch (i) {
+    case 0:  gfx->drawRect(cx - 5, cy - 4, 10, 8, C_BLACK); break;          // marquee
+    case 1:  gfx->drawCircle(cx - 1, cy - 1, 4, C_BLACK);
+             gfx->drawLine(cx - 1, cy + 3, cx + 4, cy + 4, C_BLACK); break; // lasso
+    case 2:  gfx->fillRect(cx - 4, cy - 3, 8, 6, C_BLACK); break;           // hand/select
+    case 3:  gfx->setTextSize(1); gfx->setTextColor(C_BLACK, C_WHITE);
+             gfx->setCursor(cx - 3, cy - 3); gfx->print('A'); break;        // text
+    case 4:  gfx->fillTriangle(cx - 4, cy - 3, cx + 4, cy - 3, cx, cy + 4, C_BLACK); break; // bucket
+    case 5:  for (int d = 0; d < 7; d++)
+               gfx->drawPixel(cx - 3 + (d * 5 % 8), cy - 3 + (d * 3 % 7), C_BLACK); break;  // spray
+    case 6:  gfx->drawLine(cx - 4, cy + 4, cx + 3, cy - 3, C_BLACK);
+             gfx->drawLine(cx - 3, cy + 4, cx + 4, cy - 3, C_BLACK); break; // brush
+    case 7:  gfx->drawLine(cx - 4, cy + 4, cx + 4, cy - 4, C_BLACK);
+             gfx->fillRect(cx + 3, cy - 4, 2, 2, C_BLACK); break;           // pencil
+    case 8:  gfx->drawLine(cx - 5, cy + 4, cx + 5, cy - 4, C_BLACK); break; // line
+    case 9:  gfx->drawRect(cx - 5, cy - 3, 10, 7, C_BLACK); break;          // eraser
+    case 10: gfx->drawRect(cx - 5, cy - 4, 10, 8, C_BLACK); break;          // rect
+    case 11: gfx->drawRoundRect(cx - 5, cy - 4, 10, 8, 3, C_BLACK); break;  // round rect
+    case 12: gfx->drawCircle(cx, cy, 4, C_BLACK); break;                    // oval
+    case 13: gfx->drawLine(cx - 5, cy + 2, cx - 2, cy - 3, C_BLACK);
+             gfx->drawLine(cx - 2, cy - 3, cx + 1, cy + 2, C_BLACK);
+             gfx->drawLine(cx + 1, cy + 2, cx + 4, cy - 3, C_BLACK); break; // freeform
+    case 14: gfx->fillRect(cx - 5, cy - 4, 10, 8, C_BLACK); break;          // filled rect
+    default: gfx->fillCircle(cx, cy, 4, C_BLACK); break;                    // filled oval
+  }
+}
+
+// The left MacPaint tool palette: a white 2x8 grid of tool glyphs.
+static void drawDeskToolPalette() {
+  const int px = 0, py = 15, pw = 36, ph = 186;
+  const int cols = 2, rows = 8, cw = pw / cols, ch = ph / rows;
+  gfx->fillRect(px, py, pw, ph, C_WHITE);
+  gfx->drawRect(px, py, pw, ph, C_BLACK);
+  for (int i = 1; i < cols; i++) gfx->drawFastVLine(px + i * cw, py, ph, C_BLACK);
+  for (int j = 1; j < rows; j++) gfx->drawFastHLine(px, py + j * ch, pw, C_BLACK);
+  for (int r = 0; r < rows; r++)
+    for (int col = 0; col < cols; col++)
+      drawDeskToolGlyph(px + col * cw + cw / 2, py + r * ch + ch / 2, r * cols + col);
+}
+
+// The bottom MacPaint palette: line-width box on the left, pattern swatches right.
+static void drawDeskPatternStrip() {
+  const int sy = 202, sh = 38;
+  gfx->fillRect(0, sy, 240, sh, C_WHITE);
+  gfx->drawRect(0, sy, 240, sh, C_BLACK);
+
+  // line-width selector box (four increasing-thickness bars)
+  gfx->drawRect(2, sy + 3, 28, sh - 6, C_BLACK);
+  for (int i = 0; i < 4; i++) gfx->fillRect(5, sy + 6 + i * 7, 22, i + 1, C_BLACK);
+
+  // pattern swatches: 12 x 2 grid
+  const int gx = 34, gy = sy + 3, pcols = 12, prows = 2;
+  const int pcw = (240 - gx - 3) / pcols, pch = (sh - 6) / prows;
+  for (int r = 0; r < prows; r++)
+    for (int col = 0; col < pcols; col++) {
+      int x = gx + col * pcw, y = gy + r * pch;
+      gfx->drawRect(x, y, pcw, pch, C_BLACK);
+      drawDeskPattern(x + 1, y + 1, pcw - 1, pch - 1, r * pcols + col);
+    }
+}
+
 void drawDeskSign() {
-  gfx->fillScreen(C_BLACK);
+  gfx->fillScreen(C_GRAY);        // classic grey desktop behind the window
   deskTypingStartMs = millis();
   deskAnimLastMs = 0;
   deskLastShown = "";             // force the first typing frame to paint
 
-  // Custom text => the tokenme.limited monochrome look (white header + text).
-  uint16_t c = (deskStatus == "custom") ? C_WHITE : deskColor();
+  // Menu bar: apple + the MacPaint menu titles.
+  gfx->fillRect(0, 0, 240, 13, C_WHITE);
+  gfx->fillCircle(7, 6, 3, C_BLACK);
+  gfx->fillRect(8, 1, 2, 3, C_BLACK);
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_BLACK, C_WHITE);
+  gfx->setCursor(14, 3);
+  gfx->print("File Edit Goodies Font FontSize Style");
+  gfx->drawFastHLine(0, 13, 240, C_BLACK);
 
-  gfx->fillRect(0, 0, 240, 34, c);
-  gfx->setTextSize(2);
-  gfx->setTextColor(C_BLACK, c);
-  gfx->setCursor(14, 10);
-  gfx->print("DESK");
+  drawDeskToolPalette();
 
+  // The "untitled" document window: outline + striped title bar + close box.
+  const int wx = 38, wy = 15, ww = 202, wh = 186;
+  gfx->drawRect(wx, wy, ww, wh, C_BLACK);
+  gfx->fillRect(wx + 1, wy + 1, ww - 2, 12, C_WHITE);
+  for (int s = wy + 3; s <= wy + 11; s += 2) gfx->drawFastHLine(wx + 2, s, ww - 4, C_BLACK);
+  gfx->fillRect(wx + 4, wy + 3, 8, 8, C_WHITE);
+  gfx->drawRect(wx + 4, wy + 3, 8, 8, C_BLACK);
+  const int tw = 8 * 6;                       // "untitled" at size 1
+  const int tx = wx + (ww - tw) / 2;
+  gfx->fillRect(tx - 3, wy + 2, tw + 6, 10, C_WHITE);   // clear stripes behind title
+  gfx->setTextColor(C_BLACK, C_WHITE);
+  gfx->setCursor(tx, wy + 3);
+  gfx->print("untitled");
+  gfx->drawFastHLine(wx, wy + 13, ww, C_BLACK);
+
+  // The white canvas the typed text is drawn into.
+  gfx->fillRect(DESK_CANVAS_X, DESK_CANVAS_Y, DESK_CANVAS_W, DESK_CANVAS_H, C_WHITE);
   drawDeskAnimatedStatus();
 
-  gfx->drawFastHLine(42, 148, 156, C_LINE);
-
-  unsigned long e = nowEpoch();
-  printCentered(170, 2, e ? hhmm(e + TZ_OFFSET) : String("--:--"), C_WHITE, C_BLACK);
-  String quoteLabel = deskText;
-  quoteLabel.toUpperCase();
-  if (quoteLabel.length() > 12) quoteLabel = quoteLabel.substring(0, 12);
-  printCentered(205, 1, deskStatusQuote(quoteLabel), C_GRAY, C_BLACK);
-  drawIpPanel();
+  drawDeskPatternStrip();
 }
 
 // ---- Companion face: the Claude "pixel creature", animated frame by frame ------
