@@ -7,7 +7,7 @@ By default it uses Anthropic response headers, which are the closest match for
 Claude's real server-side usage limits. Set CLAWDMETER_USAGE_SOURCE=local to use
 Claude Code's local JSONL transcripts instead.
 
-Runs on system Python 3, no pip installs.
+Runs on system Python 3. YouTube Music duration metadata uses optional yt-dlp.
 """
 import json
 import os
@@ -26,12 +26,15 @@ from pathlib import Path
 
 # ---- Edit if needed ----
 DEVICE_URL = os.environ.get("CLAWDMETER_DEVICE_URL", "http://clawdmeter.local")
-POLL_INTERVAL = 60                       # seconds
+POLL_INTERVAL = 60                       # seconds between Claude usage polls
+NOWPLAYING_TICK = 8                      # seconds between YouTube Music tab reads
+NOWPLAYING_RESYNC = 30                   # coarse position resync; avoid pushes every tick
 RAW_USAGE_SOURCE = os.environ.get("CLAWDMETER_USAGE_SOURCE", "api").lower()
 USAGE_SOURCE = {"server": "api", "headers": "api"}.get(RAW_USAGE_SOURCE, RAW_USAGE_SOURCE)
 RATE_LIMIT_BACKOFF = 10 * 60             # seconds when API does not send Retry-After
 DEVICE_TIMEOUT = float(os.environ.get("CLAWDMETER_DEVICE_TIMEOUT", "5"))
 DEVICE_PUSH_ATTEMPTS = int(os.environ.get("CLAWDMETER_DEVICE_PUSH_ATTEMPTS", "3"))
+YTDLP_CACHE_SECONDS = int(os.environ.get("CLAWDMETER_YTDLP_CACHE_SECONDS", "900"))
 
 # Local-log mode cannot know Anthropic's real server-side rate limit. Set these
 # to the token budgets you want the ESP progress bars to represent.
@@ -236,6 +239,158 @@ def mac_metrics():
     }
 
 
+# ---- YouTube Music now-playing (read from a Chrome tab title) ----
+# We read the *tab title* and URL of any open YouTube Music tab. The guard at the
+# top returns "" before the "Google Chrome" tell block runs when Chrome is not
+# already running, so a background daemon never launches the browser. Current
+# position requires Chrome's View > Developer > Allow JavaScript from Apple Events.
+NOWPLAYING_SUFFIXES = (" - YouTube Music", " | YouTube Music")
+YTDLP_CACHE = {}
+YTDLP_WARNED = False
+NOWPLAYING_SCRIPT = (
+    'tell application "System Events"\n'
+    '  if not ((name of processes) contains "Google Chrome") then return ""\n'
+    'end tell\n'
+    'tell application "Google Chrome"\n'
+    '  repeat with w in windows\n'
+    '    repeat with t in tabs of w\n'
+    '      set ti to title of t\n'
+    '      set u to URL of t\n'
+    '      if u contains "music.youtube.com" or ti ends with "- YouTube Music" or ti ends with "| YouTube Music" then\n'
+    '        set meta to "-1|-1|-1"\n'
+    '        try\n'
+    '          set meta to execute t javascript "(function(){var v=document.querySelector(\'video\'); if(!v) return \'-1|-1|-1\'; return Math.floor(v.currentTime||-1)+\'|\' + Math.floor(v.duration||-1)+\'|\' + (v.paused?1:0);})()"\n'
+    '        end try\n'
+    '        return ti & linefeed & u & linefeed & meta\n'
+    '      end if\n'
+    '    end repeat\n'
+    '  end repeat\n'
+    'end tell\n'
+    'return ""\n'
+)
+
+
+def parse_nowplaying_title(raw):
+    for suffix in NOWPLAYING_SUFFIXES:
+        if raw.endswith(suffix):
+            raw = raw[:-len(suffix)]
+            break
+    raw = raw.strip()
+    if " - " in raw:
+        title, artist = raw.rsplit(" - ", 1)
+        return (title.strip(), artist.strip())
+    return (raw, "")
+
+
+def parse_playback_meta(raw):
+    try:
+        pos, dur, paused = raw.split("|", 2)
+        paused_i = int(float(paused))
+        if paused_i not in (-1, 0, 1):
+            paused_i = -1
+        return int(float(pos)), int(float(dur)), paused_i
+    except (AttributeError, TypeError, ValueError):
+        return -1, -1, -1
+
+
+def ytdlp_metadata(url, title="", artist=""):
+    """Return static metadata from yt-dlp, or {} if yt-dlp is unavailable/fails."""
+    global YTDLP_WARNED
+    if not url and not title:
+        return {}
+
+    now = time.monotonic()
+    source = url if ("watch?" in url or "youtu.be/" in url) else ""
+    is_search = False
+    if not source and title:
+        source = "ytsearch1:" + " ".join(part for part in (title, artist) if part).strip()
+        is_search = True
+    if not source:
+        return {}
+
+    cached = YTDLP_CACHE.get(source)
+    if cached and now - cached[0] < YTDLP_CACHE_SECONDS:
+        return cached[1]
+
+    try:
+        import yt_dlp
+    except ImportError:
+        if not YTDLP_WARNED:
+            print("yt-dlp metadata disabled: install with `python3 -m pip install yt-dlp`",
+                  file=sys.stderr)
+            YTDLP_WARNED = True
+        return {}
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": False,
+        "noplaylist": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(source, download=False)
+    except Exception as e:
+        print(f"yt-dlp metadata failed: {e}", file=sys.stderr)
+        return {}
+
+    if info.get("_type") == "playlist" and info.get("entries"):
+        info = info["entries"][0] or {}
+
+    meta = {
+        "title": (info.get("track") or info.get("title") or "").strip(),
+        "artist": (info.get("artist") or info.get("uploader") or "").strip(),
+        "duration": int(info.get("duration") or -1),
+        "search": is_search,
+    }
+    YTDLP_CACHE[source] = (now, meta)
+    return meta
+
+
+def read_now_playing():
+    """Return (title, artist, pos, dur, paused) for YouTube Music, else empty.
+
+    YT Music's tab title varies. It may be "Song - Artist - YouTube Music",
+    or just "Song | YouTube Music", so parse defensively rather than with a
+    strict pattern. yt-dlp augments the title-derived metadata with canonical
+    duration; browser JS supplies current position when Chrome allows it.
+    """
+    raw = run_text(["osascript", "-e", NOWPLAYING_SCRIPT], timeout=4).strip()
+    if not raw:
+        return ("", "", -1, -1, -1)
+
+    parts = raw.splitlines()
+    title, artist = parse_nowplaying_title(parts[0] if parts else "")
+    url = parts[1].strip() if len(parts) > 1 else ""
+    pos, browser_dur, paused = parse_playback_meta(parts[2] if len(parts) > 2 else "")
+    meta = ytdlp_metadata(url, title, artist)
+
+    if meta.get("title") and not meta.get("search"):
+        title = meta["title"]
+    if meta.get("artist") and not artist and not meta.get("search"):
+        artist = meta["artist"]
+    dur = meta.get("duration") or browser_dur
+    return (title, artist, pos, dur, paused)
+
+
+def push_now_playing(title, artist, pos=-1, dur=-1, paused=-1):
+    """Best-effort push of the current song. UTF-8 is preserved (Thai stays Thai)."""
+    # Pad title so short titles have breathing room at the edges when centered.
+    padded = f" {title} " if title else title
+    url = (f"{DEVICE_URL}/nowplaying?title={urllib.parse.quote(padded)}"
+           f"&artist={urllib.parse.quote(artist)}"
+           f"&pos={int(pos)}&dur={int(dur)}&paused={int(paused)}")
+    try:
+        device_post(url)
+        shown = title or "— Not Playing —"
+        timing = f" [{pos}/{dur}s]" if pos >= 0 and dur > 0 else ""
+        state = " paused" if paused == 1 and title else ""
+        print(f"now playing: {shown}" + (f" — {artist}" if artist else "") + timing + state)
+    except Exception as e:
+        print(f"nowplaying push failed: {e}", file=sys.stderr)
+
+
 def base_result(**kw):
     """A push payload with every field defaulted; pollers fill what they have."""
     r = {"s": -1, "w": -1, "st": 0, "wt": 0,
@@ -343,6 +498,11 @@ def push(r):
            f"&sr={r['sr']}&wr={r['wr']}&stat={urllib.parse.quote(r['stat'])}"
            f"&bind={r['bind']}&t={r['t']}"
            f"&cpu={r['cpu']}&mem={r['mem']}&disk={r['disk']}&bat={r['bat']}")
+    device_post(url)
+
+
+def device_post(url):
+    """POST to the device with the shared retry/timeout policy."""
     last_error = None
     attempts = max(1, DEVICE_PUSH_ATTEMPTS)
     for attempt in range(1, attempts + 1):
@@ -367,7 +527,7 @@ def push(r):
     if isinstance(last_error, (TimeoutError, socket.timeout)):
         raise TimeoutError(
             f"device push timed out after {DEVICE_TIMEOUT:g}s "
-            f"({attempts} attempts): {DEVICE_URL}/usage"
+            f"({attempts} attempts): {url}"
         ) from last_error
     if isinstance(last_error, urllib.error.URLError):
         if isinstance(last_error.reason, socket.timeout):
@@ -389,55 +549,94 @@ def push_mac_only(reason):
         print(f"device push failed: {push_error}", file=sys.stderr)
 
 
+def poll_and_push_usage():
+    """Poll Claude usage once and push it (with Mac metrics). Returns the number
+    of seconds to wait before the next usage poll (normally POLL_INTERVAL, or a
+    rate-limit backoff on 429)."""
+    try:
+        r = poll_usage()
+        r.update(mac_metrics())
+        push(r)
+        if USAGE_SOURCE == "local":
+            print(f"session={r['s']}% ({r['st']} tok)  weekly={r['w']}% ({r['wt']} tok)  "
+                  f"cpu={r['cpu']}% mem={r['mem']}% bat={r['bat']}%")
+        else:
+            print(f"session={r['s']}%  weekly={r['w']}%  status={r['stat'] or '?'}  "
+                  f"cpu={r['cpu']}% mem={r['mem']}% bat={r['bat']}%")
+        return r["sleep"]
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            print("401 Unauthorized: run any Claude Code command to refresh login.",
+                  file=sys.stderr)
+            push_mac_only("claude_auth")
+        elif e.code == 429:
+            s, w = usage_from_headers(e.headers)
+            sleep_for = retry_after_seconds(e.headers)
+            if s >= 0 or w >= 0:
+                r = base_result(s=s, w=w, **extra_from_headers(e.headers))
+                r.update(mac_metrics())
+                try:
+                    push(r)
+                except Exception as push_error:
+                    print(f"device push failed: {push_error}", file=sys.stderr)
+                print(f"rate limited: session={s}% weekly={w}% "
+                      f"(retrying in {sleep_for}s)", file=sys.stderr)
+            else:
+                print(f"rate limited by Anthropic API "
+                      f"(retrying in {sleep_for}s)", file=sys.stderr)
+                push_mac_only("claude_rate_limited")
+            return sleep_for
+        else:
+            print(f"API error {e.code}: {e.reason}", file=sys.stderr)
+            push_mac_only("claude_http_error")
+    except TimeoutError as e:
+        print(f"timeout: {e}", file=sys.stderr)
+        push_mac_only("claude_timeout")
+    except urllib.error.URLError as e:
+        print(f"network error: {e}", file=sys.stderr)
+        push_mac_only("claude_network_error")
+    except Exception as e:
+        print(f"error: {e}", file=sys.stderr)
+        push_mac_only("claude_unavailable")
+    return POLL_INTERVAL
+
+
 def main():
-    print(f"Clawdmeter daemon -> {DEVICE_URL}, source={USAGE_SOURCE}, polling every {POLL_INTERVAL}s")
+    print(f"Clawdmeter daemon -> {DEVICE_URL}, source={USAGE_SOURCE}, usage every "
+          f"{POLL_INTERVAL}s, now-playing every {NOWPLAYING_TICK}s")
+    # The song changes every few minutes, so we read it on a fast ~8s tick while
+    # keeping the (costlier) Claude usage poll on its 60s cadence via a deadline.
+    next_usage = 0.0          # monotonic time of the next due usage poll (0 = now)
+    # Seed with the "nothing playing" state so a daemon (re)start with no song
+    # open sends no /nowplaying push — otherwise it would yank the device to a
+    # blank "Not Playing" music card on every launchd restart. The first real
+    # song still differs from this and pushes.
+    last_song = ("", "", -1, -1, -1)
+    last_nowplaying_push = 0.0
     while True:
-        sleep_for = POLL_INTERVAL
-        try:
-            r = poll_usage()
-            r.update(mac_metrics())
-            sleep_for = r["sleep"]
-            push(r)
-            if USAGE_SOURCE == "local":
-                print(f"session={r['s']}% ({r['st']} tok)  weekly={r['w']}% ({r['wt']} tok)  "
-                      f"cpu={r['cpu']}% mem={r['mem']}% bat={r['bat']}%")
-            else:
-                print(f"session={r['s']}%  weekly={r['w']}%  status={r['stat'] or '?'}  "
-                      f"cpu={r['cpu']}% mem={r['mem']}% bat={r['bat']}%")
-        except urllib.error.HTTPError as e:
-            if e.code == 401:
-                print("401 Unauthorized: run any Claude Code command to refresh login.",
-                      file=sys.stderr)
-                push_mac_only("claude_auth")
-            elif e.code == 429:
-                s, w = usage_from_headers(e.headers)
-                sleep_for = retry_after_seconds(e.headers)
-                if s >= 0 or w >= 0:
-                    r = base_result(s=s, w=w, **extra_from_headers(e.headers))
-                    r.update(mac_metrics())
-                    try:
-                        push(r)
-                    except Exception as push_error:
-                        print(f"device push failed: {push_error}", file=sys.stderr)
-                    print(f"rate limited: session={s}% weekly={w}% "
-                          f"(retrying in {sleep_for}s)", file=sys.stderr)
-                else:
-                    print(f"rate limited by Anthropic API "
-                          f"(retrying in {sleep_for}s)", file=sys.stderr)
-                    push_mac_only("claude_rate_limited")
-            else:
-                print(f"API error {e.code}: {e.reason}", file=sys.stderr)
-                push_mac_only("claude_http_error")
-        except TimeoutError as e:
-            print(f"timeout: {e}", file=sys.stderr)
-            push_mac_only("claude_timeout")
-        except urllib.error.URLError as e:
-            print(f"network error: {e}", file=sys.stderr)
-            push_mac_only("claude_network_error")
-        except Exception as e:
-            print(f"error: {e}", file=sys.stderr)
-            push_mac_only("claude_unavailable")
-        time.sleep(sleep_for)
+        now = time.monotonic()
+        if now >= next_usage:
+            next_usage = now + poll_and_push_usage()
+
+        song = read_now_playing()
+        title, artist, pos, dur, paused = song
+        last_title, last_artist, _last_pos, last_dur, last_paused = last_song
+        state_changed = (
+            title != last_title or
+            artist != last_artist or
+            dur != last_dur or
+            paused != last_paused
+        )
+        resync_due = (
+            bool(title) and pos >= 0 and dur > 0 and
+            now - last_nowplaying_push >= NOWPLAYING_RESYNC
+        )
+        last_song = song
+        if state_changed or resync_due:
+            push_now_playing(*song)
+            last_nowplaying_push = now
+
+        time.sleep(NOWPLAYING_TICK)
 
 
 if __name__ == "__main__":

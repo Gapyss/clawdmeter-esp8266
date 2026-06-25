@@ -86,6 +86,10 @@ python3 daemon/claudemeter_daemon.py
   ESP8266 is still settling after a reboot. Override with
   `CLAWDMETER_DEVICE_TIMEOUT` or `CLAWDMETER_DEVICE_PUSH_ATTEMPTS` if your WiFi is
   unusually slow.
+- YouTube Music duration metadata uses `yt-dlp`:
+  `python3 -m pip install --user yt-dlp`. To show live remaining time instead of
+  just duration, enable Chrome's **View > Developer > Allow JavaScript from Apple
+  Events** so the daemon can read the tab's `<video>` current position.
 
 The daemon targets `http://clawdmeter.local` by default (macOS resolves `.local`
 natively). If it can't resolve, set `CLAWDMETER_DEVICE_URL` to the device's IP
@@ -136,8 +140,9 @@ http://clawdmeter.local/mode?screen=face
 
 `face` is the animated Claude block-mascot companion: it blinks, glances around,
 shuffles its feet, and changes mood/color from your live usage (HAPPY → FOCUS →
-ALERT, plus a SLEEPY look at night). The dashboard mode button cycles
-Claude → Mac → Desk → Face.
+ALERT, plus a SLEEPY look at night). Companion states add coding, sleep, monk,
+and love scenes (`/face?state=love` shows the mascot with pulsing hearts and a
+small laptop). The dashboard mode button cycles Claude → Mac → Desk → Face.
 
 To set brightness directly:
 
