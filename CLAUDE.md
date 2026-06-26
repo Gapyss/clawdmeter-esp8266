@@ -131,19 +131,21 @@ bind = binding limit 1=session/2=weekly, t = server epoch for the UTC clock,
 cpu/mem/disk/bat = Mac system percentages) · `GET /usage.json` current state for
 the page poller, including `bl` current brightness ·
 `GET|POST /brightness?value=0..255` sets/persists TFT brightness and returns JSON ·
-`GET|POST /mode?screen=mac|claude|desk|face` switches the physical LCD mode
+`GET|POST /mode?screen=mac|claude|desk|face|music|timer` switches the physical LCD mode
 (`face` = the animated Claude block-mascot companion; it animates via a `millis()`
 poll in `loop()`, **not** a timer ISR, so it adds ~0 IRAM, and its frame interval
 is recomputed from each frame's measured render time so FPS tracks board headroom) ·
-`GET|POST /face?state=idle|working|sleep|monk|toggle` flips the companion between the
+`GET|POST /face?state=idle|working|sleep|monk|love|toggle` flips the companion between the
 idle look-around mascot, a desk-coding scene (headphones on, typing at a laptop),
 a sleeping scene (closed eyes, breathing nod, drifting Z particles), and a meditating
 "claude monk" scene (a white stone statue with grey robe-fold shadows and a raised
 palm; the head is a white circular dome with the orange Claude burst overlaid so the
 white shows as a halo ring around the spokes — the body holds still while the burst
-spokes radiate), and switches the LCD to face mode if it isn't already. Extra scenes
+spokes radiate), plus a love scene (idle mascot, small laptop foreground, pulsing
+Claude-orange hearts, footer mood `I LOVE MY JOB`), and switches the LCD to face mode if it isn't already. Extra scenes
 reuse the same grid renderer: `deskBase` + `WORK_FRAMES` for coding, `SLEEP_FRAMES`
-over the idle base for sleep, and `monkBase` + `MONK_FRAMES` for the monk. State is
+over the idle base for sleep, `monkBase` + `MONK_FRAMES` for the monk, and
+`LOVE_FRAMES` over the idle base for love. State is
 runtime-only (not persisted), defaults to idle, and is reported as `face` in
 `/usage.json` ·
 `GET|POST /desk?status=coding|meeting|busy|break|claude` pushes a preset desk status word;
@@ -159,6 +161,35 @@ so don't reintroduce a full canvas `fillRect` in that path. The `color` param (a
 status color) is accepted/persisted only to tint the **dashboard dot** — it does **not** tint
 the physical sign, which is monochrome black-on-white. No clock/quote/IP on this screen
 (device stays reachable at `clawdmeter.local`) ·
+`GET|POST /nowplaying?title=&artist=&pos=&dur=&paused=&lyric=&lyric2=&lt=` pushes the
+**YouTube Music now-playing** song (the daemon reads it from a Chrome tab title via AppleScript
+and URL-encodes UTF-8 — Thai is preserved, not ASCII-stripped). `lyric` and `lyric2` are the
+current/upcoming lyric lines from lrclib.net; `lt` is the next-line playback position in seconds,
+or `-1` when the daemon is driving plain-lyric fallback timing. **Now-playing is a web-only
+feature: the endpoint stores the song but does NOT switch the physical LCD** — the dashboard's
+"Now Playing" panel (toggled by a top-bar button) reads the state from `/usage.json`. The physical
+`music` screen is selected via `/mode?screen=music` — either directly, or by **opening** the
+dashboard's "Now Playing" panel, whose toggle button now also requests `/mode?screen=music` (the
+daemon's `/nowplaying` push still never steals focus on its own); if MUSIC happens to be the
+current screen a track/pause change repaints it in place (chrome stays put, no flash), while
+position/lyric resyncs repaint only the progress/time footer and lyric band. The physical screen
+is the Tend-style "Now Playing 240" card: cream paper (`#F8F3E1`), deep-olive ink, ember accent,
+warm bark vinyl-disc art on the left, title/artist meta column on the right, a thin ember progress
+bar with elapsed and remaining time, and a two-line lyric band replacing the source design's
+bottom transport controls. There are no animated EQ bars. The header is a small `NOW PLAYING` /
+`PAUSED` eyebrow plus clock, redrawn on switch-in, pause/identity changes, and minute rollover
+only. Title and artist marquees are advanced by a `millis()` poll in `loop()` — **not** a timer
+ISR, same reason as `face`.
+Title/artist/lyric lines are echoed in `/usage.json` (JSON-escaped) for `curl` debugging. **Thai/Latin text
+is drawn from bundled Ayuthaya GFXfont tables (`thai_font.h`)**, not the built-in 5×7 font: that
+font is ASCII-only and Arduino_GFX's `drawChar()` can't index code points > 255, so
+`musicDrawText()` decodes UTF-8 and blits glyphs itself, indexing by full code point. Thai
+combining marks (tone marks, upper/lower vowels) carry `xAdvance==0` with negative `xOffset` in
+this font, so a faithful per-glyph blit stacks them over the base consonant with **no special
+combining logic** (tone marks on a bare consonant float a touch high — legible, acceptable for
+v1). Regenerate the font tables with `firmware/tools/gen_thai_font.sh` (needs Adafruit
+`fontconvert` built against freetype); `#define MUSIC_TITLE_SCROLL 0` is the documented fallback
+to stop scrolling if the Thai marquee ever looks wrong ·
 `/update` firmware-only OTA upload form.
 
 ## Commands

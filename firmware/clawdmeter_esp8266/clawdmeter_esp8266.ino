@@ -8,6 +8,7 @@
 #include <WiFiManager.h>          // install "WiFiManager" by tzapu via Library Manager
 #include <Arduino_GFX_Library.h>  // install "GFX Library for Arduino" by moononournation
 #include <time.h>                 // NTP clock (so the wait screen has time before any push)
+#include "thai_font.h"            // Thai+Latin GFXfont tables for the MUSIC screen (PROGMEM)
 
 ESP8266WebServer server(80);
 
@@ -46,6 +47,12 @@ struct FacePatch { uint8_t r, c, v; };
 // One animation step: hold (ms), base shift (dr,dc), and an optional cell patch.
 struct FaceFrame { uint16_t hold; int8_t dr, dc; const FacePatch *ops; uint8_t nops; };
 #define FACE_PATCH(a) (a), (uint8_t)(sizeof(a) / sizeof((a)[0]))
+
+// A MUSIC-screen text face: a Latin+Thai GFXfont pair (thai_font.h) plus the
+// baseline ascent for its band. Defined up here for the same reason as FaceExpr:
+// Arduino injects auto-prototypes for the functions that take it at the top of
+// the file, so the type must already be visible there.
+struct MusicFace { const GFXfont *latin; const GFXfont *thai; int16_t ascent; };
 
 static const uint8_t EEPROM_MARKER_ADDR = 0;
 static const uint8_t EEPROM_BRIGHTNESS_ADDR = 1;
@@ -117,12 +124,14 @@ static const uint8_t SCREEN_CLAUDE = 0;
 static const uint8_t SCREEN_MAC = 1;
 static const uint8_t SCREEN_DESK = 2;
 static const uint8_t SCREEN_FACE = 3;
+static const uint8_t SCREEN_MUSIC = 4;
 uint8_t lcdScreen = SCREEN_CLAUDE;
 static const uint8_t FACE_MODE_IDLE = 0;
 static const uint8_t FACE_MODE_WORKING = 1;
 static const uint8_t FACE_MODE_SLEEP = 2;
 static const uint8_t FACE_MODE_MONK = 3;
-static const uint8_t FACE_MODE_COUNT = 4;   // for the /face?state=toggle wrap
+static const uint8_t FACE_MODE_LOVE = 4;
+static const uint8_t FACE_MODE_COUNT = 5;   // for the /face?state=toggle wrap
 uint8_t faceMode = FACE_MODE_IDLE; // runtime-only face sub-state
 String deskStatus = "coding";   // coding / meeting / busy / break / claude
 String deskText = "CODING";
@@ -130,6 +139,16 @@ String deskColorName = "green";
 unsigned long deskTypingStartMs = 0;
 unsigned long deskAnimLastMs = 0;
 String deskLastShown = "";       // last drawn typing frame; skip redraw when unchanged
+String npTitle = "";             // YouTube Music now-playing title (UTF-8, may be Thai)
+String npArtist = "";            // now-playing artist (UTF-8)
+int npPos = -1;                  // current playback position, seconds
+int npDur = -1;                  // total track duration, seconds
+int npPaused = -1;               // -1 unknown, 0 playing, 1 paused
+unsigned long npPosBaseMs = 0;   // millis() when npPos was received
+String npLyric = "";             // current lyric line (UTF-8, daemon-pushed from lrclib)
+String npLyric2 = "";            // upcoming lyric line (shown dim below the current one)
+int npLyricAt = -1;              // playback pos (s) at which npLyric2 promotes to current; -1 = none
+bool musicChromeReady = false;   // MUSIC chrome is static; pushes repaint title/artist only
 bool otaInProgress = false;     // true while /update is writing firmware
 bool otaUpdateOk = false;
 bool meterRedrawPending = false;
@@ -164,8 +183,9 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--text);margin:0;min-height:100vh}
   main{width:min(980px,100%);margin:0 auto;padding:22px;display:grid;gap:16px}
   header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);padding-bottom:14px}
-  h1{font-size:24px;line-height:1.1;margin:0;font-weight:700;letter-spacing:0}
-  .sub,.muted{color:var(--muted);font-size:13px}
+  h1{font-size:20px;line-height:1.15;margin:0;font-weight:700;letter-spacing:0}
+  .sub{color:var(--muted);font-size:12px;line-height:1.35;margin-top:3px}
+  .muted{color:var(--muted);font-size:13px}
   .status{display:flex;align-items:center;gap:8px;justify-content:flex-end;flex-wrap:wrap;text-align:right}
   .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 3px rgba(139,148,158,.15)}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
@@ -199,8 +219,12 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <main>
 <header>
   <div><h1 id="title">Clawdmeter</h1><div class="sub" id="subtitle">Claude usage monitor</div></div>
-  <div class="status"><span class="dot" id="dot"></span><span id="status">connecting...</span><a class="btn" id="switchMode" href="?view=mac">Mac</a></div>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">connecting...</span><a class="btn" id="npToggle" href="#">&#9835; Now Playing</a><a class="btn" id="switchMode" href="?view=mac">Mac</a></div>
 </header>
+<section class="panel" id="npPanel" style="display:none">
+  <div class="label"><span class="name">Now Playing</span><span class="muted" id="npArtist">--</span></div>
+  <div class="v" id="npTitle">- Not Playing -</div>
+</section>
 <section class="grid">
   <div class="panel meter" id="sessionCard">
     <div class="label"><span class="name" id="sessionName">Session window</span><span class="pct" id="sp">--</span></div>
@@ -222,7 +246,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <section class="panel">
   <div class="label"><span class="name">Device</span><span class="muted" id="mode">waiting</span></div>
   <div class="actions"><a class="btn" href="/usage.json">Usage JSON</a><a class="btn" href="/update">OTA Update</a><a class="btn" href="/restart" id="restartDevice">Restart</a><a class="btn danger" href="/factory-reset" id="factoryReset">Reset Settings</a></div>
-  <div class="control"><span class="muted">Companion</span><div class="actions"><button class="btn faceBtn" data-state="idle">Idle</button><button class="btn faceBtn" data-state="working">Working</button><button class="btn faceBtn" data-state="sleep">Sleep</button><button class="btn faceBtn" data-state="monk">Monk</button></div><span class="v" id="faceValue">--</span></div>
+  <div class="control"><span class="muted">Companion</span><div class="actions"><button class="btn faceBtn" data-state="idle">Idle</button><button class="btn faceBtn" data-state="working">Working</button><button class="btn faceBtn" data-state="sleep">Sleep</button><button class="btn faceBtn" data-state="monk">Monk</button><button class="btn faceBtn" data-state="love">Love</button></div><span class="v" id="faceValue">--</span></div>
   <div class="control"><span class="muted">Desk</span><div class="actions"><button class="btn deskBtn" data-status="coding">Coding</button><button class="btn deskBtn" data-status="meeting">Meeting</button><button class="btn deskBtn" data-status="claude">Claude</button><button class="btn deskBtn" data-status="busy">Busy</button><button class="btn deskBtn" data-status="break">Break</button></div><span class="v" id="deskValue">--</span></div>
   <div class="control"><span class="muted">Custom</span><div class="deskCustom"><input id="deskText" type="text" maxlength="12" value="CODING"><select id="deskColor"><option value="green">Green</option><option value="claude">Claude</option><option value="red">Red</option><option value="amber">Amber</option><option value="blue">Blue</option><option value="white">White</option></select><button class="btn" id="deskApply">Apply</button></div><span></span></div>
   <div class="control"><span class="muted">Brightness</span><input id="brightness" type="range" min="0" max="120" value="90"><span class="v" id="brightnessValue">90</span></div>
@@ -269,6 +293,13 @@ document.getElementById('switchMode').onclick=function(e){
   view=view=='claude'?'mac':view=='mac'?'desk':view=='desk'?'face':'claude';
   saveView(view);
   tick();
+};
+document.getElementById('npToggle').onclick=function(e){
+  if(e&&e.preventDefault)e.preventDefault();
+  var p=document.getElementById('npPanel');
+  var show=p.style.display=='none';
+  p.style.display=show?'':'none';
+  if(show)fetch('/mode?screen=music',{cache:'no-store'}).catch(function(e){});
 };
 function setDeskUi(status){
   document.getElementById('deskValue').textContent=status?status.toUpperCase():'--';
@@ -353,6 +384,9 @@ async function tick(){
     document.getElementById('age').textContent=ageText(d.age);
     var live=d.age>=0&&d.age<=120;
     document.body.className=live?'':'stale';
+    var npt=(d.title||'').trim();
+    document.getElementById('npTitle').textContent=npt||'- Not Playing -';
+    document.getElementById('npArtist').textContent=d.artist||'';
     if(view=='desk'){
       document.getElementById('title').textContent='Desk Status';
       document.getElementById('subtitle').textContent='Physical status sign';
@@ -399,7 +433,7 @@ async function tick(){
       document.getElementById('mode').textContent='mac system metrics';
     }else if(view=='face'){
       document.getElementById('title').textContent='Companion';
-      document.getElementById('subtitle').textContent=d.face=='working'?'Coding at the desk':d.face=='sleep'?'Claude sleeping on the cube':d.face=='monk'?'Claude meditating on the cube':'Claude mascot on the cube';
+      document.getElementById('subtitle').textContent=d.face=='working'?'Coding at the desk':d.face=='sleep'?'Claude sleeping on the cube':d.face=='monk'?'Claude meditating on the cube':d.face=='love'?'Claude loves the job':'Claude mascot on the cube';
       document.getElementById('switchMode').textContent='Claude';
       document.getElementById('switchMode').href='?view=claude';
       document.getElementById('sessionName').textContent='Session window';
@@ -415,7 +449,7 @@ async function tick(){
       document.getElementById('sc').textContent='';
       document.getElementById('wt').textContent='Live on the LCD';
       document.getElementById('wc').textContent='';
-      var mood=d.face=='working'?'CODING':d.face=='sleep'?'SLEEP':d.face=='monk'?'ZEN':(d.s>=80||d.w>=90||(d.stat&&d.stat!='allowed')?'ALERT':d.s>=40?'FOCUS':'HAPPY');
+      var mood=d.face=='working'?'CODING':d.face=='sleep'?'SLEEP':d.face=='monk'?'ZEN':d.face=='love'?'I LOVE MY JOB':(d.s>=80||d.w>=90||(d.stat&&d.stat!='allowed')?'ALERT':d.s>=40?'FOCUS':'HAPPY');
       st.textContent='COMPANION - '+mood;
       dot.style.background=mood=='ALERT'?'var(--red)':mood=='FOCUS'?'var(--yellow)':'var(--claude)';
       document.getElementById('mode').textContent='companion face';
@@ -539,13 +573,29 @@ static String screenName() {
   if (lcdScreen == SCREEN_DESK) return "desk";
   if (lcdScreen == SCREEN_MAC) return "mac";
   if (lcdScreen == SCREEN_FACE) return "face";
+  if (lcdScreen == SCREEN_MUSIC) return "music";
   return "claude";
+}
+
+// Escape a UTF-8 string for embedding in the hand-built /usage.json. Song titles
+// are arbitrary text, so a stray quote/backslash would otherwise break the JSON;
+// raw multibyte UTF-8 is valid inside a JSON string and passes through untouched.
+static String jsonEscape(const String &s) {
+  String o;
+  o.reserve(s.length() + 8);
+  for (unsigned int i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '"' || c == '\\') { o += '\\'; o += c; }
+    else if ((uint8_t)c >= 0x20) o += c;   // drop control chars, keep UTF-8 bytes
+  }
+  return o;
 }
 
 static const char *faceModeName() {
   if (faceMode == FACE_MODE_WORKING) return "working";
   if (faceMode == FACE_MODE_SLEEP) return "sleep";
   if (faceMode == FACE_MODE_MONK) return "monk";
+  if (faceMode == FACE_MODE_LOVE) return "love";
   return "idle";
 }
 
@@ -565,12 +615,21 @@ void handleUsageJson() {
              ",\"bat\":" + String(macBatteryPct) +
              ",\"screen\":\"" + screenName() + "\"" +
              ",\"face\":\"" + String(faceModeName()) + "\"" +
+             ",\"title\":\"" + jsonEscape(npTitle) + "\"" +
+             ",\"artist\":\"" + jsonEscape(npArtist) + "\"" +
+             ",\"lyric\":\"" + jsonEscape(npLyric) + "\"" +
+             ",\"lyric2\":\"" + jsonEscape(npLyric2) + "\"" +
+             ",\"pos\":" + String(musicDisplayPos()) +
+             ",\"dur\":" + String(npDur) +
+             ",\"paused\":" + String(npPaused) +
              ",\"desk\":\"" + deskStatus + "\"" +
              ",\"deskText\":\"" + deskText + "\"" +
              ",\"deskColor\":\"" + deskColorName + "\"" +
              ",\"bl\":" + String(lcdBrightness) +
+             ",\"heap\":" + String(ESP.getFreeHeap()) +
              ",\"now\":" + String(nowEpoch()) +
              ",\"rst\":\"" + bootReason + "\"" +
+             ",\"rinfo\":\"" + jsonEscape(bootInfo) + "\"" +
              ",\"up\":" + String(millis() / 1000) +
              ",\"age\":" + String(age) + "}";
   server.sendHeader("Cache-Control", "no-store");
@@ -604,17 +663,69 @@ void handleMode() {
     if (screen == "mac") nextScreen = SCREEN_MAC;
     else if (screen == "desk") nextScreen = SCREEN_DESK;
     else if (screen == "face") nextScreen = SCREEN_FACE;
+    else if (screen == "music") nextScreen = SCREEN_MUSIC;
     else if (screen == "claude") nextScreen = SCREEN_CLAUDE;
     if (nextScreen != lcdScreen) {
       lcdScreen = nextScreen;
       if (lcdScreen == SCREEN_MAC) macChromeReady = false;
       if (lcdScreen == SCREEN_CLAUDE) claudeChromeReady = false;
+      if (lcdScreen == SCREEN_MUSIC) musicChromeReady = false;
       lastTickEpoch = 0;
       drawMeter();
     }
   }
   server.sendHeader("Connection", "close");
   server.send(200, "text/plain", screenName());
+}
+
+// Daemon pushes the current YouTube Music song here:
+// POST /nowplaying?title=<urlenc UTF-8>&artist=<urlenc UTF-8>&pos=&dur=&paused=&lyric=&lyric2=&lt=
+// Stores the song WITHOUT stealing focus: now-playing is a web-only feature
+// (the dashboard's Now Playing panel reads it from /usage.json). The physical
+// MUSIC screen is manual-only — selected via /mode?screen=music. If MUSIC happens
+// to be the current screen, track/pause changes repaint the content; position/lyric
+// resyncs repaint just the progress/time footer and lyric band.
+void handleNowPlaying() {
+  String oldTitle = npTitle;
+  String oldArtist = npArtist;
+  int oldDur = npDur;
+  int oldPaused = npPaused;
+  String oldLyric = npLyric;
+  String oldLyric2 = npLyric2;
+  if (server.hasArg("title")) npTitle = server.arg("title");
+  if (server.hasArg("artist")) npArtist = server.arg("artist");
+  if (server.hasArg("pos")) {
+    npPos = server.arg("pos").toInt();
+    npPosBaseMs = millis();
+  }
+  if (server.hasArg("dur")) npDur = server.arg("dur").toInt();
+  if (server.hasArg("paused")) npPaused = constrain(server.arg("paused").toInt(), -1, 1);
+  bool trackChanged = oldTitle != npTitle || oldArtist != npArtist;
+  bool durationChanged = oldDur != npDur;
+  bool identityChanged = trackChanged || durationChanged;
+  if (trackChanged) {
+    npPos = 0;
+    npPosBaseMs = millis();
+  }
+  if (server.hasArg("lyric")) {
+    npLyric = server.arg("lyric");
+    npLyric2 = server.hasArg("lyric2") ? server.arg("lyric2") : String("");
+    npLyricAt = server.hasArg("lt") ? server.arg("lt").toInt() : -1;
+  } else if (identityChanged) {
+    npLyric = "";
+    npLyric2 = "";
+    npLyricAt = -1;
+  }
+  if (lcdScreen == SCREEN_MUSIC) {
+    bool pausedChanged = oldPaused != npPaused;
+    if (identityChanged || pausedChanged) drawMusic();
+    else {
+      musicDrawFooter();
+      if (oldLyric != npLyric || oldLyric2 != npLyric2) musicDrawLyrics();
+    }
+  }
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", "ok");
 }
 
 static String sanitizedDeskText(String text) {
@@ -739,6 +850,21 @@ void handleFactoryReset() {
 #define C_INK    0x18E3   // warm near-black text / headline number (#1F1E1D-ish)
 #define C_TAN    0xEF5C   // bar track / soft fills (#EDE9E0)
 #define C_MUTE   0x8C92   // warm taupe for secondary labels on cream (#8A8578-ish)
+
+// MUSIC screen — "Tend" warm-paper palette (claude.ai/design Now Playing card).
+// Cream paper surface, deep-olive ink, ember accent, warm bark vinyl disc.
+#define C_MUS_PAPER      0xFF9C  // #F8F3E1 primary surface (cream)
+#define C_MUS_PAPER_DEEP 0xEF39  // #EDE6CB sunken surface / progress track
+#define C_MUS_PAPER_SOFT 0xFFDE  // #FDFBF2 raised surface / vinyl label ring
+#define C_MUS_PAPER_LINE 0xD654  // #D3C8A2 hairline border on paper
+#define C_MUS_INK        0x18E2  // #1F1D11 primary text (title / current lyric)
+#define C_MUS_INK_SOFT   0x5AA6  // #5B5536 secondary text (artist)
+#define C_MUS_INK_MUTED  0x946D  // #948D6F tertiary (eyebrow / clock / times / next lyric)
+#define C_MUS_INK_FAINT  0xC5F2  // #C5BD96 disabled / placeholder
+#define C_MUS_EMBER      0xEAE7  // #E85D3C primary accent (progress fill, vinyl label)
+#define C_MUS_EMBER_DEEP 0xC203  // #C2421F pressed ember
+#define C_MUS_BARK       0x8B68  // #8B6F47 vinyl disc rings (warm earth)
+#define C_MUS_BARK_DEEP  0x6A86  // #6B5236 vinyl disc grooves
 
 // Display clock/reset times in Thailand time. Pushed epochs are UTC; add the
 // offset only when formatting wall-clock text (durations/countdowns stay raw).
@@ -1341,7 +1467,7 @@ static const uint8_t CELL_EMPTY = 0, CELL_BODY = 1, CELL_EYE = 2,
                      // around the white robe so it separates from the cream paper
                      // (the white robe is invisible on cream without it).
                      CELL_SPARK = 10, CELL_ROBE = 11, CELL_ROBE_SHADE = 12,
-                     CELL_ROBE_EDGE = 13;
+                     CELL_ROBE_EDGE = 13, CELL_HEART = 14;
 // RGB565 for the desk-scene cells (converted from the reference #hex palette).
 #define C_HP_LIGHT  0xD6FC   // headphone light  #d4dde2
 #define C_HP_SHADOW 0x8C93   // headphone shadow #8a9199
@@ -1661,6 +1787,59 @@ static const FaceFrame MONK_FRAMES[] = {
 };
 static const uint8_t MONK_NFRAMES = sizeof(MONK_FRAMES) / sizeof(MONK_FRAMES[0]);
 
+// ---- "Love" scene: idle mascot, laptop foreground, pulsing hearts ---------------
+// Reuses creatureBase (no new base grid): every frame overlays the small static
+// laptop across the lower body plus two Claude-orange hearts above the mascot.
+// Only the hearts change, so the scene stays calmer than WORKING.
+static const FacePatch L_HEARTS_LEFT[] = {
+  {3,5,CELL_HEART},{3,7,CELL_HEART},{4,4,CELL_HEART},{4,5,CELL_HEART},
+  {4,6,CELL_HEART},{4,7,CELL_HEART},{5,5,CELL_HEART},{5,6,CELL_HEART},
+  {4,15,CELL_HEART},{4,16,CELL_HEART},{5,15,CELL_HEART},{5,16,CELL_HEART},
+  {13,6,CELL_SCREEN},{13,7,CELL_SCREEN},{13,8,CELL_SCREEN},{13,9,CELL_SCREEN},
+  {13,10,CELL_SCREEN},{13,11,CELL_SCREEN},{13,12,CELL_SCREEN},{13,13,CELL_SCREEN},
+  {14,6,CELL_SCREEN},{14,7,CELL_SCREEN},{14,8,CELL_SCREEN},{14,9,CELL_LOGO},
+  {14,10,CELL_LOGO},{14,11,CELL_SCREEN},{14,12,CELL_SCREEN},{14,13,CELL_SCREEN},
+  {15,5,CELL_LBASE},{15,6,CELL_LBASE},{15,7,CELL_LBASE},{15,8,CELL_LBASE},
+  {15,9,CELL_LBASE},{15,10,CELL_LBASE},{15,11,CELL_LBASE},{15,12,CELL_LBASE},
+  {15,13,CELL_LBASE},{15,14,CELL_LBASE},{16,6,CELL_LBASE},{16,7,CELL_LBASE},
+  {16,8,CELL_LBASE},{16,9,CELL_LBASE},{16,10,CELL_LBASE},{16,11,CELL_LBASE},
+  {16,12,CELL_LBASE},{16,13,CELL_LBASE},
+};
+static const FacePatch L_HEARTS_BOTH[] = {
+  {3,5,CELL_HEART},{3,6,CELL_HEART},{4,5,CELL_HEART},{4,6,CELL_HEART},
+  {3,15,CELL_HEART},{3,16,CELL_HEART},{4,15,CELL_HEART},{4,16,CELL_HEART},
+  {13,6,CELL_SCREEN},{13,7,CELL_SCREEN},{13,8,CELL_SCREEN},{13,9,CELL_SCREEN},
+  {13,10,CELL_SCREEN},{13,11,CELL_SCREEN},{13,12,CELL_SCREEN},{13,13,CELL_SCREEN},
+  {14,6,CELL_SCREEN},{14,7,CELL_SCREEN},{14,8,CELL_SCREEN},{14,9,CELL_LOGO},
+  {14,10,CELL_LOGO},{14,11,CELL_SCREEN},{14,12,CELL_SCREEN},{14,13,CELL_SCREEN},
+  {15,5,CELL_LBASE},{15,6,CELL_LBASE},{15,7,CELL_LBASE},{15,8,CELL_LBASE},
+  {15,9,CELL_LBASE},{15,10,CELL_LBASE},{15,11,CELL_LBASE},{15,12,CELL_LBASE},
+  {15,13,CELL_LBASE},{15,14,CELL_LBASE},{16,6,CELL_LBASE},{16,7,CELL_LBASE},
+  {16,8,CELL_LBASE},{16,9,CELL_LBASE},{16,10,CELL_LBASE},{16,11,CELL_LBASE},
+  {16,12,CELL_LBASE},{16,13,CELL_LBASE},
+};
+static const FacePatch L_HEARTS_RIGHT[] = {
+  {4,5,CELL_HEART},{4,6,CELL_HEART},{5,5,CELL_HEART},{5,6,CELL_HEART},
+  {3,14,CELL_HEART},{3,16,CELL_HEART},{4,13,CELL_HEART},{4,14,CELL_HEART},
+  {4,15,CELL_HEART},{4,16,CELL_HEART},{5,14,CELL_HEART},{5,15,CELL_HEART},
+  {13,6,CELL_SCREEN},{13,7,CELL_SCREEN},{13,8,CELL_SCREEN},{13,9,CELL_SCREEN},
+  {13,10,CELL_SCREEN},{13,11,CELL_SCREEN},{13,12,CELL_SCREEN},{13,13,CELL_SCREEN},
+  {14,6,CELL_SCREEN},{14,7,CELL_SCREEN},{14,8,CELL_SCREEN},{14,9,CELL_LOGO},
+  {14,10,CELL_LOGO},{14,11,CELL_SCREEN},{14,12,CELL_SCREEN},{14,13,CELL_SCREEN},
+  {15,5,CELL_LBASE},{15,6,CELL_LBASE},{15,7,CELL_LBASE},{15,8,CELL_LBASE},
+  {15,9,CELL_LBASE},{15,10,CELL_LBASE},{15,11,CELL_LBASE},{15,12,CELL_LBASE},
+  {15,13,CELL_LBASE},{15,14,CELL_LBASE},{16,6,CELL_LBASE},{16,7,CELL_LBASE},
+  {16,8,CELL_LBASE},{16,9,CELL_LBASE},{16,10,CELL_LBASE},{16,11,CELL_LBASE},
+  {16,12,CELL_LBASE},{16,13,CELL_LBASE},
+};
+static const FaceFrame LOVE_FRAMES[] = {
+  {520, 0, 0, FACE_PATCH(L_HEARTS_LEFT)},
+  {360, 0, 0, FACE_PATCH(L_HEARTS_BOTH)},
+  {520, 0, 0, FACE_PATCH(L_HEARTS_RIGHT)},
+  {360, 0, 0, FACE_PATCH(L_HEARTS_BOTH)},
+};
+static const uint8_t LOVE_NFRAMES = sizeof(LOVE_FRAMES) / sizeof(LOVE_FRAMES[0]);
+
 static uint8_t faceGrid[F_N][F_N];   // the frame currently shown
 static uint8_t facePrev[F_N][F_N];   // last grid drawn (for cell diffing)
 static bool faceInit = false;
@@ -1675,6 +1854,7 @@ static const FaceFrame *faceFrameList() {
   if (faceMode == FACE_MODE_WORKING) return WORK_FRAMES;
   if (faceMode == FACE_MODE_SLEEP) return SLEEP_FRAMES;
   if (faceMode == FACE_MODE_MONK) return MONK_FRAMES;
+  if (faceMode == FACE_MODE_LOVE) return LOVE_FRAMES;
   return FACE_FRAMES;
 }
 
@@ -1682,6 +1862,7 @@ static uint8_t faceFrameCount() {
   if (faceMode == FACE_MODE_WORKING) return WORK_NFRAMES;
   if (faceMode == FACE_MODE_SLEEP) return SLEEP_NFRAMES;
   if (faceMode == FACE_MODE_MONK) return MONK_NFRAMES;
+  if (faceMode == FACE_MODE_LOVE) return LOVE_NFRAMES;
   return FACE_NFRAMES;
 }
 
@@ -1709,6 +1890,7 @@ static FaceExpr faceComputeExpr() {
   if (faceMode == FACE_MODE_WORKING) { e.mood = "CODING"; e.id = 10; }
   else if (faceMode == FACE_MODE_SLEEP) { e.mood = "SLEEP"; e.id = 11; }
   else if (faceMode == FACE_MODE_MONK) { e.mood = "ZEN"; e.id = 12; }
+  else if (faceMode == FACE_MODE_LOVE) { e.mood = "I LOVE MY JOB"; e.id = 13; }
   return e;
 }
 
@@ -1731,6 +1913,7 @@ static uint16_t faceCellColor(uint8_t v, uint16_t body) {
     case CELL_ROBE:      return C_WHITE;     // monk stone robe (static, not mood-tinted)
     case CELL_ROBE_SHADE: return C_GRAY;     // robe fold/edge shadow (gives shape)
     case CELL_ROBE_EDGE: return C_INK;       // ink silhouette outline on cream
+    case CELL_HEART:     return C_CLAUDE;    // love-mode hearts
     default:             return C_CREAM;     // empty == the ivory paper background
   }
 }
@@ -1837,9 +2020,14 @@ static void faceDrawStatus(const FaceExpr &e) {
   unsigned long ee = nowEpoch();
   String clk = ee ? hhmmss(ee + TZ_OFFSET) : String("--:--:--");
   gfx->fillRect(12, 205, 96, 16, C_CREAM);           // clear old mood value
-  gfx->setTextSize(2);
   gfx->setTextColor(e.spark, C_CREAM);
-  gfx->setCursor(14, 206); gfx->print(e.mood);
+  if (faceMode == FACE_MODE_LOVE) {
+    gfx->setTextSize(1);
+    gfx->setCursor(14, 210); gfx->print(e.mood);
+  } else {
+    gfx->setTextSize(2);
+    gfx->setCursor(14, 206); gfx->print(e.mood);
+  }
   gfx->fillRect(130, 205, 104, 16, C_CREAM);         // clear old clock
   printRight(232, 206, 2, clk, C_INK, C_CREAM);
 }
@@ -1889,10 +2077,633 @@ static void faceTick() {
   if (sec != faceClockSec) { faceClockSec = sec; faceDrawStatus(e); }
 }
 
+// ---- MUSIC screen: YouTube Music now-playing (scrolling title + artist) --------
+// A cream "now playing" card in the same System-7 spirit as the desk sign. The
+// title is a millis()-driven marquee (the face/desk poll pattern, NOT a timer
+// ISR, so zero IRAM and no WiFi starvation); long artists use the same pattern.
+// Two-phase repaint like mac/desk: chrome once on switch-in, then only the title
+// strip + artist band repaint (no fillScreen per push).
+//
+// Text is rendered with bundled Ayuthaya GFXfonts (thai_font.h) so Thai titles
+// show real glyphs — the built-in 5x7 font is ASCII-only and Arduino_GFX's
+// drawChar() can't index code points > 255. We blit glyphs ourselves from the
+// PROGMEM tables, indexing by full UTF-8 code point. Thai combining marks carry
+// xAdvance==0 with negative xOffsets, so a faithful per-glyph blit stacks them
+// over the base consonant for free (no special combining logic).
+
+// Fallback lever (plan option C): set to 0 to stop scrolling Thai/long titles
+// (draw left-aligned, clipped at the edge) if the marquee ever looks wrong.
+#define MUSIC_TITLE_SCROLL 1
+
+// ascent = max px a glyph rises above the baseline (used to seat the baseline in
+// the band); the values are the per-size maxima measured across both ranges.
+static const MusicFace MUSIC_FACE_TITLE  = { &MusicTitleLatin,  &MusicTitleThai,  37 };
+static const MusicFace MUSIC_FACE_ARTIST = { &MusicArtistLatin, &MusicArtistThai, 28 };
+
+// "Tend" Now Playing (claude.ai/design): a horizontal header row, a vinyl-disc
+// album art on the LEFT with the title + artist meta column to its right, a thin
+// ember progress bar, and — per the user's deviation from the source design — a
+// two-line LYRIC band filling the bottom where the transport controls would be.
+
+#define MUSIC_PAD            16    // outer paper margin
+
+// header (eyebrow "NOW PLAYING" left, clock right)
+#define MUSIC_HDR_Y          14    // baseline of the header row
+
+// vinyl disc art (left)
+#define MUSIC_ART_X          16
+#define MUSIC_ART_Y          30
+#define MUSIC_ART_W          72
+#define MUSIC_ART_H          72
+#define MUSIC_ART_R          12
+#define MUSIC_LABEL_R        11    // ember center label (22 px dia)
+
+// meta column (title + artist marquees), right of the art. The marquee canvases
+// live in this column, not the full width, so they never erase the disc.
+#define MUSIC_META_X         100
+#define MUSIC_META_W         124   // 240 - META_X - PAD
+#define MUSIC_TITLE_BAND_Y   24
+#define MUSIC_TITLE_BAND_H   40
+#define MUSIC_ARTIST_BAND_Y  72
+#define MUSIC_ARTIST_BAND_H  30
+
+// progress + elapsed/-remaining times
+#define MUSIC_PROGRESS_Y     116
+#define MUSIC_TIME_Y         126
+
+// two-line lyric band (bottom): current line in ink, upcoming line dim below
+#define MUSIC_LYRIC_Y        150   // top of the band
+#define MUSIC_LYRIC_H        74    // 150..224
+#define MUSIC_LYRIC1_BASE    180   // current-line baseline (artist face)
+#define MUSIC_LYRIC2_BASE    212   // upcoming-line baseline
+
+// marquee
+#define MUSIC_SCROLL_PXPS    42    // marquee speed, px/sec
+#define MUSIC_SCROLL_STEP_PX 2     // 2px frames ~=21 FPS, leaves WiFi loop headroom
+#define MUSIC_TITLE_PAD      4
+#define MUSIC_SCROLL_HOLD_MS 1000  // readable pause at the beginning/end of a long title
+#define MUSIC_SCROLL_GAP     60    // blank px between the title's tail and its wrap-around head
+
+int  musicScrollX = 0;             // px scrolled left from the readable start position
+unsigned long musicScrollLastMs = 0;
+unsigned long musicScrollHoldUntilMs = 0; // millis() deadline for the start/end hold pause
+unsigned long musicTimeLastMs = 0;
+int  musicTitleW = 0;              // measured title width (sum of glyph advances)
+int  musicArtistW = 0;
+bool musicTitleScrolls = false;    // title wider than the panel -> animate
+int  musicClockMin = -1;           // last header-clock minute drawn (-1 = none yet)
+Arduino_Canvas_Indexed *musicTitleCanvas = nullptr;
+bool musicTitleCanvasOk = false;
+Arduino_Canvas_Indexed *musicArtistCanvas = nullptr;
+bool musicArtistCanvasOk = false;
+bool musicArtistScrolls = false;   // artist wider than panel -> animate
+int  musicArtistScrollX = 0;
+unsigned long musicArtistScrollLastMs = 0;
+unsigned long musicArtistScrollHoldUntilMs = 0;
+String musicLyricShown1 = "\x01";  // last lyric lines painted (sentinel forces first draw)
+String musicLyricShown2 = "\x01";
+int  musicLyricScrollX1 = 0;
+int  musicLyricScrollX2 = 0;
+int  musicLyricW1 = 0;
+int  musicLyricW2 = 0;
+bool musicLyricScrolls1 = false;
+bool musicLyricScrolls2 = false;
+unsigned long musicLyricScrollLastMs = 0;
+unsigned long musicLyricScrollHoldUntilMs = 0;
+
+static String musicTitleStr() {
+  return npTitle.length() ? npTitle : String("- Not Playing -");
+}
+
+// Decode one UTF-8 code point at s[i], advancing i past it. Malformed/truncated
+// bytes decode to the raw byte so plain ASCII can never break. Thai is 3-byte.
+static uint32_t utf8Next(const String &s, unsigned int &i) {
+  uint8_t c = (uint8_t)s[i++];
+  uint8_t n;
+  uint32_t cp;
+  if (c < 0x80) return c;
+  else if ((c & 0xE0) == 0xC0) { n = 1; cp = c & 0x1F; }
+  else if ((c & 0xF0) == 0xE0) { n = 2; cp = c & 0x0F; }
+  else if ((c & 0xF8) == 0xF0) { n = 3; cp = c & 0x07; }
+  else return c;                                 // stray continuation/invalid lead byte
+  for (uint8_t k = 0; k < n; k++) {
+    if (i >= s.length() || ((uint8_t)s[i] & 0xC0) != 0x80) return c;  // truncated
+    cp = (cp << 6) | ((uint8_t)s[i++] & 0x3F);
+  }
+  return cp;
+}
+
+// Which bundled font (if any) carries this code point.
+static const GFXfont *musicGlyphFont(const MusicFace &f, uint32_t cp) {
+  if (cp >= 0x0E00 && cp <= 0x0E7F) return f.thai;
+  if (cp >= 0x20 && cp <= 0x7E) return f.latin;
+  return nullptr;                                // unsupported -> skipped
+}
+
+// Safe 16-bit read of a PROGMEM (flash/IROM) field. DO NOT replace with
+// pgm_read_word: GFX_Library_for_Arduino's Arduino_GFX.h #undefs the ESP8266
+// core's safe pgm_read_word and redefines it as a naive *(uint16_t*) deref
+// ("workaround of a15 asm compile error"). A narrow 16-bit load from the
+// flash-mapped IROM region faults with LoadStoreErrorCause (exception 3) — it
+// was crash-rebooting the device on every switch to the MUSIC screen. memcpy_P
+// uses the safe aligned-32-bit path. (pgm_read_byte/_dword are NOT poisoned.)
+static inline uint16_t musicReadWordP(const void *flashAddr) {
+  uint16_t v;
+  memcpy_P(&v, flashAddr, sizeof(v));
+  return v;
+}
+
+// Sum of glyph advances (combining marks advance 0, so they add no width). This
+// is the marquee/centering metric, matching how the glyphs are laid out.
+static int musicTextWidth(const MusicFace &f, const String &s) {
+  int w = 0;
+  unsigned int i = 0;
+  while (i < s.length()) {
+    uint32_t cp = utf8Next(s, i);
+    const GFXfont *gf = musicGlyphFont(f, cp);
+    if (!gf) continue;
+    const GFXglyph *g = (const GFXglyph *)pgm_read_dword(&gf->glyph) +
+                        (cp - musicReadWordP(&gf->first));
+    w += pgm_read_byte(&g->xAdvance);
+  }
+  return w;
+}
+
+// Blit a UTF-8 string at baseline (x, baselineY). Transparent (only set pixels
+// drawn) so combining marks overlay the base cleanly; the caller clears the
+// target first. One startWrite/endWrite batches physical SPI writes; for canvases
+// it just mirrors the same draw contract. writePixel clips at target edges.
+static void musicDrawText(Arduino_GFX *target, const MusicFace &f, int x, int baselineY,
+                          const String &s, uint16_t fg) {
+  target->startWrite();
+  unsigned int i = 0;
+  while (i < s.length()) {
+    uint32_t cp = utf8Next(s, i);
+    const GFXfont *gf = musicGlyphFont(f, cp);
+    if (!gf) continue;
+    const GFXglyph *g = (const GFXglyph *)pgm_read_dword(&gf->glyph) +
+                        (cp - musicReadWordP(&gf->first));
+    uint16_t bo = musicReadWordP(&g->bitmapOffset);
+    uint8_t  w  = pgm_read_byte(&g->width);
+    uint8_t  h  = pgm_read_byte(&g->height);
+    uint8_t  xa = pgm_read_byte(&g->xAdvance);
+    int8_t   xo = (int8_t)pgm_read_byte(&g->xOffset);
+    int8_t   yo = (int8_t)pgm_read_byte(&g->yOffset);
+    const uint8_t *bitmap = (const uint8_t *)pgm_read_dword(&gf->bitmap);
+    uint8_t bits = 0, bit = 0;
+    for (uint8_t yy = 0; yy < h; yy++) {
+      for (uint8_t xx = 0; xx < w; xx++) {
+        if (!(bit++ & 7)) bits = pgm_read_byte(&bitmap[bo++]);
+        if (bits & 0x80) target->writePixel(x + xo + xx, baselineY + yo + yy, fg);
+        bits <<= 1;
+      }
+    }
+    x += xa;
+  }
+  target->endWrite();
+}
+
+static void musicLayoutTitle() {
+  musicTitleW = musicTextWidth(MUSIC_FACE_TITLE, musicTitleStr());
+#if MUSIC_TITLE_SCROLL
+  musicTitleScrolls = (musicTitleW > MUSIC_META_W);
+#else
+  musicTitleScrolls = false;
+#endif
+  musicScrollX = 0;
+  musicScrollLastMs = millis();
+  musicScrollHoldUntilMs = millis() + MUSIC_SCROLL_HOLD_MS;
+}
+
+static void musicLayoutArtist() {
+  musicArtistW = musicTextWidth(MUSIC_FACE_ARTIST, npArtist);
+  musicArtistScrolls = (musicArtistW > MUSIC_META_W);
+  musicArtistScrollX = 0;
+  musicArtistScrollLastMs = millis();
+  musicArtistScrollHoldUntilMs = millis() + MUSIC_SCROLL_HOLD_MS;
+}
+
+// Title/artist are left-aligned in the meta column to the right of the disc.
+// `baseX` is the column's left in TARGET coords: 0 for the column canvas (whose
+// origin is already MUSIC_META_X), or MUSIC_META_X for the gfx fallback. When a
+// line is wider than the column it scrolls; a second copy one gap past the first
+// makes the marquee wrap seamlessly. writePixel clips glyphs at the column edge.
+static void musicBlitTitle(Arduino_GFX *target, int baseX, int baseline) {
+  int x = baseX + (musicTitleScrolls ? -musicScrollX : 0);
+  musicDrawText(target, MUSIC_FACE_TITLE, x, baseline, musicTitleStr(), C_MUS_INK);
+  if (musicTitleScrolls)
+    musicDrawText(target, MUSIC_FACE_TITLE, x + musicTitleW + MUSIC_SCROLL_GAP,
+                  baseline, musicTitleStr(), C_MUS_INK);
+}
+
+static void musicBlitArtist(Arduino_GFX *target, int baseX, int baseline) {
+  int x = baseX + (musicArtistScrolls ? -musicArtistScrollX : 0);
+  musicDrawText(target, MUSIC_FACE_ARTIST, x, baseline, npArtist, C_MUS_INK_SOFT);
+  if (musicArtistScrolls)
+    musicDrawText(target, MUSIC_FACE_ARTIST, x + musicArtistW + MUSIC_SCROLL_GAP,
+                  baseline, npArtist, C_MUS_INK_SOFT);
+}
+
+static bool musicEnsureTitleCanvas() {
+  if (musicTitleCanvasOk) return true;
+  if (!musicTitleCanvas) {
+    musicTitleCanvas = new Arduino_Canvas_Indexed(
+        MUSIC_META_W, MUSIC_TITLE_BAND_H, gfx, MUSIC_META_X, MUSIC_TITLE_BAND_Y);
+    if (!musicTitleCanvas) return false;
+  }
+  musicTitleCanvasOk = musicTitleCanvas->begin(GFX_SKIP_OUTPUT_BEGIN);
+  return musicTitleCanvasOk;
+}
+
+static void musicDrawTitle() {
+  int baseline = MUSIC_FACE_TITLE.ascent;
+  if (!musicEnsureTitleCanvas()) {
+    gfx->fillRect(MUSIC_META_X, MUSIC_TITLE_BAND_Y, MUSIC_META_W, MUSIC_TITLE_BAND_H, C_MUS_PAPER);
+    musicBlitTitle(gfx, MUSIC_META_X, MUSIC_TITLE_BAND_Y + baseline);
+    return;
+  }
+  musicTitleCanvas->fillScreen(C_MUS_PAPER);
+  musicBlitTitle(musicTitleCanvas, 0, baseline);
+  musicTitleCanvas->flush();
+}
+
+static bool musicEnsureArtistCanvas() {
+  if (musicArtistCanvasOk) return true;
+  if (!musicArtistCanvas) {
+    musicArtistCanvas = new Arduino_Canvas_Indexed(
+        MUSIC_META_W, MUSIC_ARTIST_BAND_H, gfx, MUSIC_META_X, MUSIC_ARTIST_BAND_Y);
+    if (!musicArtistCanvas) return false;
+  }
+  musicArtistCanvasOk = musicArtistCanvas->begin(GFX_SKIP_OUTPUT_BEGIN);
+  return musicArtistCanvasOk;
+}
+
+static void musicDrawArtist() {
+  int baseline = MUSIC_FACE_ARTIST.ascent;
+  if (!npArtist.length()) {
+    if (musicEnsureArtistCanvas()) {
+      musicArtistCanvas->fillScreen(C_MUS_PAPER);
+      musicArtistCanvas->flush();
+    } else {
+      gfx->fillRect(MUSIC_META_X, MUSIC_ARTIST_BAND_Y, MUSIC_META_W, MUSIC_ARTIST_BAND_H, C_MUS_PAPER);
+    }
+    return;
+  }
+  if (!musicEnsureArtistCanvas()) {
+    gfx->fillRect(MUSIC_META_X, MUSIC_ARTIST_BAND_Y, MUSIC_META_W, MUSIC_ARTIST_BAND_H, C_MUS_PAPER);
+    musicBlitArtist(gfx, MUSIC_META_X, MUSIC_ARTIST_BAND_Y + baseline);
+    return;
+  }
+  musicArtistCanvas->fillScreen(C_MUS_PAPER);
+  musicBlitArtist(musicArtistCanvas, 0, baseline);
+  musicArtistCanvas->flush();
+}
+
+static bool musicStopped() {
+  return !npTitle.length();
+}
+
+static bool musicPausedKnown() {
+  return !musicStopped() && npPaused == 1;
+}
+
+static bool musicShouldAnimate() {
+  // Animate whenever a song is present; deliberately ignore the paused flag so the
+  // marquee / indicator / visualizer keep moving even when playback is paused.
+  return !musicStopped();
+}
+
+// Vinyl-disc album art (static — drawn once with the chrome). A warm bark disc
+// with concentric grooves and an ember center label, per the Tend design's
+// "no photo, concentric warm rings" art. No EQ animation: the scrolling lyrics
+// supply the screen's motion, and the disc has none in the source design.
+static void musicDrawArt() {
+  int cx = MUSIC_ART_X + MUSIC_ART_W / 2;
+  int cy = MUSIC_ART_Y + MUSIC_ART_H / 2;
+  gfx->fillRoundRect(MUSIC_ART_X, MUSIC_ART_Y, MUSIC_ART_W, MUSIC_ART_H,
+                     MUSIC_ART_R, C_MUS_PAPER_DEEP);     // backing (rounded corners)
+  gfx->fillCircle(cx, cy, MUSIC_ART_W / 2 - 1, C_MUS_BARK);
+  for (int r = MUSIC_ART_W / 2 - 3; r > MUSIC_LABEL_R + 1; r -= 3)
+    gfx->drawCircle(cx, cy, r, C_MUS_BARK_DEEP);          // grooves
+  gfx->fillCircle(cx, cy, MUSIC_LABEL_R + 2, C_MUS_PAPER_SOFT);  // label ring
+  gfx->fillCircle(cx, cy, MUSIC_LABEL_R, C_MUS_EMBER);          // ember center label
+  gfx->fillCircle(cx, cy, 2, C_MUS_PAPER_SOFT);                 // spindle hole
+}
+
+static String musicClock(int seconds) {
+  if (seconds < 0) seconds = 0;
+  int m = seconds / 60;
+  int s = seconds % 60;
+  String out = String(m) + ":";
+  if (s < 10) out += "0";
+  out += String(s);
+  return out;
+}
+
+static int musicDisplayPos() {
+  if (npPos < 0) return -1;
+  long p = npPos;
+  if (npPaused == 0) p += (long)(millis() - npPosBaseMs) / 1000L;
+  if (npDur > 0 && p > npDur) p = npDur;
+  return (int)p;
+}
+
+static bool musicProgressReliable() {
+  return !musicStopped() && npDur > 0 && musicDisplayPos() >= 0;
+}
+
+// Header row: an "eyebrow" label on the left (NOW PLAYING, or PAUSED to reflect
+// state) and the wall clock on the right, both in muted ink on paper — the small
+// built-in 5x7 font (the labels are ASCII). Redrawn on switch-in, on each
+// pause/identity change, and once per minute for the clock; never per second, so
+// it can't flicker. Seeds musicClockMin so the tick knows the minute it painted.
+static void musicDrawHeader() {
+  gfx->fillRect(0, 0, 240, 22, C_MUS_PAPER);
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_MUS_INK_MUTED, C_MUS_PAPER);
+  gfx->setCursor(MUSIC_PAD, MUSIC_HDR_Y - 6);
+  gfx->print(musicPausedKnown() ? F("PAUSED") : F("NOW PLAYING"));
+  unsigned long e = nowEpoch();
+  String t = e ? hhmm(e + TZ_OFFSET) : String("--:--");
+  printRight(224, MUSIC_HDR_Y - 6, 1, t, C_MUS_INK_MUTED, C_MUS_PAPER);
+  musicClockMin = e ? (int)(((e + TZ_OFFSET) / 60) % 60) : -1;
+}
+
+static void musicDrawTime() {
+  gfx->fillRect(0, MUSIC_TIME_Y - 1, 240, 10, C_MUS_PAPER);
+  if (!musicProgressReliable()) return;
+  int pos = musicDisplayPos();
+  uint16_t tc = C_MUS_INK_MUTED;
+  gfx->setTextSize(1);
+  gfx->setTextColor(tc, C_MUS_PAPER);
+  gfx->setCursor(MUSIC_PAD, MUSIC_TIME_Y);
+  gfx->print(musicClock(pos));
+  int rem = npDur - pos;
+  printRight(224, MUSIC_TIME_Y, 1, rem > 0 ? "-" + musicClock(rem) : "0:00", tc, C_MUS_PAPER);
+}
+
+static void musicDrawProgress() {
+  const int x = MUSIC_PAD, y = MUSIC_PROGRESS_Y, w = 240 - MUSIC_PAD * 2, h = 4;
+  gfx->fillRect(x - 4, y - 4, w + 8, h + 8, C_MUS_PAPER);
+  gfx->fillRoundRect(x, y, w, h, 2, C_MUS_PAPER_DEEP);   // sunken track
+  if (!musicProgressReliable()) return;
+  int pos = musicDisplayPos();
+  uint16_t fc = musicPausedKnown() ? C_MUS_INK_FAINT : C_MUS_EMBER;
+  int fillW = constrain((int)((long)pos * w / npDur), 0, w);
+  if (fillW > 0) gfx->fillRoundRect(x, y, fillW, h, 2, fc);
+}
+
+// Progress + time region only (between the art and the lyric band). The lyric
+// band has its own change-gated repaint and is NOT cleared here.
+static void musicDrawFooter() {
+  gfx->fillRect(0, MUSIC_PROGRESS_Y - 6, 240,
+                (MUSIC_TIME_Y + 10) - (MUSIC_PROGRESS_Y - 6), C_MUS_PAPER);
+  musicDrawTime();
+  musicDrawProgress();
+}
+
+static bool musicCompactLyricText(const String &s, String &out) {
+  out = "";
+  unsigned int i = 0;
+  while (i < s.length()) {
+    uint32_t cp = utf8Next(s, i);
+    if (cp >= 0x0E00 && cp <= 0x0E7F) return false;  // keep Thai on the real font
+    if (cp >= 0x20 && cp <= 0x7E) out += (char)cp;
+    else if (cp == 0x2018 || cp == 0x2019) out += '\'';
+    else if (cp == 0x201C || cp == 0x201D) out += '"';
+    else if (cp == 0x2013 || cp == 0x2014) out += '-';
+    else if (cp == 0x2026) out += "...";
+    else out += '?';
+  }
+  return out.length() > 0;
+}
+
+static bool musicShouldCompactLyric(const String &s, String &compact) {
+  const int maxChars = (240 - MUSIC_PAD * 2) / 6;
+  return musicCompactLyricText(s, compact) &&
+         (musicTextWidth(MUSIC_FACE_ARTIST, s) > (240 - MUSIC_PAD * 2) ||
+          (int)compact.length() > maxChars);
+}
+
+static bool musicLyricUsesCompact(const String &s) {
+  String compact;
+  return musicShouldCompactLyric(s, compact);
+}
+
+static void musicDrawCompactAsciiLyric(int y, const String &s, uint16_t fg) {
+  const int maxChars = (240 - MUSIC_PAD * 2) / 6;  // default GFX font, textSize 1
+  gfx->setTextSize(1);
+  gfx->setTextColor(fg, C_MUS_PAPER);
+
+  String rest = s;
+  for (int row = 0; row < 3 && rest.length(); row++) {
+    String line = rest;
+    if ((int)rest.length() > maxChars) {
+      int remainingRows = 2 - row;
+      int minBreak = (int)rest.length() - remainingRows * maxChars;
+      if (minBreak < 1) minBreak = 1;
+      int breakAt = -1;
+      int searchFrom = maxChars;
+      if (searchFrom >= (int)rest.length()) searchFrom = (int)rest.length() - 1;
+      for (int i = searchFrom; i >= minBreak; i--) {
+        if (rest[i] == ' ') { breakAt = i; break; }
+      }
+      if (breakAt < 1 || breakAt > maxChars) breakAt = maxChars;
+      line = rest.substring(0, breakAt);
+      int start = breakAt;
+      while (start < (int)rest.length() && rest[start] == ' ') start++;
+      rest = rest.substring(start);
+    } else {
+      rest = "";
+    }
+    if ((int)line.length() > maxChars) line = line.substring(0, maxChars);
+    gfx->setCursor(MUSIC_PAD, y + row * 10);
+    gfx->print(line);
+  }
+}
+
+static void musicDrawLyricLine(const String &s, int baseline, uint16_t fg,
+                               int scrollX, int textW, bool scrolls) {
+  String compact;
+  if (musicShouldCompactLyric(s, compact)) {
+    musicDrawCompactAsciiLyric(baseline - 27, compact, fg);
+    return;
+  }
+  int x = MUSIC_PAD + (scrolls ? -scrollX : 0);
+  musicDrawText(gfx, MUSIC_FACE_ARTIST, x, baseline, s, fg);
+  if (scrolls)
+    musicDrawText(gfx, MUSIC_FACE_ARTIST, x + textW + MUSIC_SCROLL_GAP,
+                  baseline, s, fg);
+}
+
+static void musicLayoutLyrics(const String &l1, const String &l2) {
+  musicLyricW1 = musicLyricUsesCompact(l1) ? 0 : musicTextWidth(MUSIC_FACE_ARTIST, l1);
+  musicLyricW2 = musicLyricUsesCompact(l2) ? 0 : musicTextWidth(MUSIC_FACE_ARTIST, l2);
+  musicLyricScrolls1 = l1.length() && musicLyricW1 > (240 - MUSIC_PAD * 2);
+  musicLyricScrolls2 = l2.length() && musicLyricW2 > (240 - MUSIC_PAD * 2);
+  musicLyricScrollX1 = 0;
+  musicLyricScrollX2 = 0;
+  musicLyricScrollLastMs = millis();
+  musicLyricScrollHoldUntilMs = millis() + MUSIC_SCROLL_HOLD_MS;
+}
+
+static void musicPaintLyrics() {
+  gfx->fillRect(0, MUSIC_LYRIC_Y, 240, MUSIC_LYRIC_H, C_MUS_PAPER);
+  if (musicLyricShown1.length())
+    musicDrawLyricLine(musicLyricShown1, MUSIC_LYRIC1_BASE, C_MUS_INK,
+                       musicLyricScrollX1, musicLyricW1, musicLyricScrolls1);
+  if (musicLyricShown2.length())
+    musicDrawLyricLine(musicLyricShown2, MUSIC_LYRIC2_BASE, C_MUS_INK_MUTED,
+                       musicLyricScrollX2, musicLyricW2, musicLyricScrolls2);
+}
+
+// Two-line lyric band at the bottom (the user's deviation from the source design,
+// which has transport controls here): the current line in ink, the upcoming line
+// dim below it. Long English/Latin lines use the compact built-in font and wrap
+// inside their lyric slot; Thai lines keep the bundled bitmap font so combining
+// marks remain correct. Repaints in place only when a line actually changes
+// (push / auto-promote), never on the 1 s tick, so the band never flickers.
+// This keeps the same opaque-repaint discipline as the title/artist bands.
+static void musicDrawLyrics() {
+  String l1 = npLyric, l2 = npLyric2;
+  if (musicStopped()) { l1 = ""; l2 = ""; }
+  if (l1 == musicLyricShown1 && l2 == musicLyricShown2) return;
+  musicLyricShown1 = l1;
+  musicLyricShown2 = l2;
+  musicLayoutLyrics(l1, l2);
+  musicPaintLyrics();
+}
+
+static void drawMusicChrome() {
+  gfx->fillScreen(C_MUS_PAPER);
+  musicDrawHeader();
+  musicDrawArt();
+  musicLyricShown1 = "\x01";        // force the lyric band to repaint after the clear
+  musicLyricShown2 = "\x01";
+  musicTimeLastMs = 0;
+  musicDrawFooter();
+}
+
+void drawMusic() {
+  if (!musicChromeReady) { drawMusicChrome(); musicChromeReady = true; }
+  else musicDrawHeader();   // refresh eyebrow (play/pause) + clock on pause/identity change
+  musicLayoutTitle();
+  musicLayoutArtist();
+  musicDrawTitle();
+  musicDrawArtist();
+  musicDrawFooter();
+  musicDrawLyrics();
+}
+
+// Per-loop tick: refresh the clock/progress, promote synced lyric lines on time,
+// and advance the title/artist marquees. No timer ISR — all millis()-polled.
+static void musicTick() {
+  unsigned long now = millis();
+
+  // Progress bar / time counter (once per second)
+  if (now - musicTimeLastMs >= 1000UL) {
+    musicTimeLastMs = now;
+    musicDrawTime();
+    musicDrawProgress();
+    // Header clock: repaint only when the displayed minute rolls over.
+    unsigned long e = nowEpoch();
+    if (e) {
+      int mn = (int)(((e + TZ_OFFSET) / 60) % 60);
+      if (mn != musicClockMin) musicDrawHeader();
+    }
+    // Synced-lyric auto-promote: when the interpolated position reaches the
+    // upcoming line's timestamp, slide it up to current (the daemon refills the
+    // next line on its following push). This keeps the swap on-beat between the
+    // daemon's coarser pushes, using the same interpolated clock as the progress.
+    if (npLyricAt >= 0 && npPaused == 0 && musicDisplayPos() >= npLyricAt) {
+      npLyric = npLyric2;
+      npLyric2 = "";
+      npLyricAt = -1;
+      musicDrawLyrics();
+    }
+  }
+
+  // Title marquee — seamless infinite loop: scroll by (titleW + gap) then reset to 0
+  // so the wrap-around second copy lands exactly where the first started.
+  if (musicTitleScrolls && musicShouldAnimate() && now >= musicScrollHoldUntilMs) {
+    int scrollMax = musicTitleW + MUSIC_SCROLL_GAP;
+    if (musicScrollX >= scrollMax) {
+      musicScrollX = 0;
+      musicScrollLastMs = now;
+      musicScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+      musicDrawTitle();
+    } else {
+      long span = (long)(now - musicScrollLastMs) * MUSIC_SCROLL_PXPS / 1000L;
+      if (span >= MUSIC_SCROLL_STEP_PX) {
+        musicScrollLastMs = now;
+        musicScrollX += (int)span;
+        if (musicScrollX >= scrollMax) {
+          musicScrollX = scrollMax;
+          musicScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+        }
+        musicDrawTitle();
+      }
+    }
+  }
+
+  // Artist marquee — same seamless-loop pattern as the title
+  if (musicArtistScrolls && musicShouldAnimate() && now >= musicArtistScrollHoldUntilMs) {
+    int artistScrollMax = musicArtistW + MUSIC_SCROLL_GAP;
+    if (musicArtistScrollX >= artistScrollMax) {
+      musicArtistScrollX = 0;
+      musicArtistScrollLastMs = now;
+      musicArtistScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+      musicDrawArtist();
+    } else {
+      long span = (long)(now - musicArtistScrollLastMs) * MUSIC_SCROLL_PXPS / 1000L;
+      if (span >= MUSIC_SCROLL_STEP_PX) {
+        musicArtistScrollLastMs = now;
+        musicArtistScrollX += (int)span;
+        if (musicArtistScrollX >= artistScrollMax) {
+          musicArtistScrollX = artistScrollMax;
+          musicArtistScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+        }
+        musicDrawArtist();
+      }
+    }
+  }
+
+  // Lyric marquee for Thai/non-compact overflow. English long lines already wrap
+  // in compact text, so only custom-font lyric lines reach this branch.
+  if ((musicLyricScrolls1 || musicLyricScrolls2) &&
+      musicShouldAnimate() && now >= musicLyricScrollHoldUntilMs) {
+    long span = (long)(now - musicLyricScrollLastMs) * MUSIC_SCROLL_PXPS / 1000L;
+    if (span >= MUSIC_SCROLL_STEP_PX) {
+      bool changed = false;
+      musicLyricScrollLastMs = now;
+      if (musicLyricScrolls1) {
+        int scrollMax = musicLyricW1 + MUSIC_SCROLL_GAP;
+        musicLyricScrollX1 += (int)span;
+        if (musicLyricScrollX1 >= scrollMax) {
+          musicLyricScrollX1 = 0;
+          musicLyricScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+        }
+        changed = true;
+      }
+      if (musicLyricScrolls2) {
+        int scrollMax = musicLyricW2 + MUSIC_SCROLL_GAP;
+        musicLyricScrollX2 += (int)span;
+        if (musicLyricScrollX2 >= scrollMax) {
+          musicLyricScrollX2 = 0;
+          musicLyricScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+        }
+        changed = true;
+      }
+      if (changed) musicPaintLyrics();
+    }
+  }
+}
+
 void drawMeter() {
   if (lcdScreen == SCREEN_MAC) { drawMacMeter(); return; }
   if (lcdScreen == SCREEN_DESK) { drawDeskSign(); return; }
   if (lcdScreen == SCREEN_FACE) { faceBegin(); return; }
+  if (lcdScreen == SCREEN_MUSIC) { drawMusic(); return; }
 
   // Two-phase repaint: draw the cream card chrome once on switch-in, then only
   // repaint values on every /usage push (no fillScreen flash). The no-data case
@@ -1926,8 +2737,8 @@ void drawMeter() {
   drawIpPanel();
 }
 
-// Toggle the companion between idle (look-around), working (desk-coding), and sleep.
-// /face?state=idle|working|sleep|monk|toggle . Switches the LCD to face mode if needed and
+// Toggle the companion between idle (look-around), working (desk-coding), sleep,
+// monk, and love. /face?state=idle|working|sleep|monk|love|toggle switches the LCD to face mode if needed and
 // restarts the animation so the new scene draws immediately. Defined after
 // drawMeter()/faceBegin() so it can call them without a forward prototype.
 void handleFace() {
@@ -1937,6 +2748,7 @@ void handleFace() {
     if (st == "working") faceMode = FACE_MODE_WORKING;
     else if (st == "sleep") faceMode = FACE_MODE_SLEEP;
     else if (st == "monk") faceMode = FACE_MODE_MONK;
+    else if (st == "love") faceMode = FACE_MODE_LOVE;
     else if (st == "idle") faceMode = FACE_MODE_IDLE;
     else if (st == "toggle") faceMode = (faceMode + 1) % FACE_MODE_COUNT;
     lcdScreen = SCREEN_FACE;
@@ -2085,6 +2897,8 @@ void setup() {
   server.on("/face", HTTP_POST, handleFace);
   server.on("/desk", HTTP_GET, handleDesk);
   server.on("/desk", HTTP_POST, handleDesk);
+  server.on("/nowplaying", HTTP_GET, handleNowPlaying);
+  server.on("/nowplaying", HTTP_POST, handleNowPlaying);
   server.on("/restart", HTTP_GET, handleRestart);
   server.on("/restart", HTTP_POST, handleRestart);
   server.on("/factory-reset", HTTP_GET, handleFactoryReset);
@@ -2109,12 +2923,20 @@ void loop() {
     // The face scene animates continuously and faceTick() already absorbs new
     // usage/mood values, so a daemon push must NOT call faceBegin() — that would
     // fillScreen + restart the animation from frame 0 (a once-a-minute flash).
-    if (lcdScreen != SCREEN_FACE) drawMeter();
+    // MUSIC shows no usage data and owns its own marquee, so a /usage push must
+    // not redraw it either (it would reset the scroll to 0 once a minute).
+    if (lcdScreen != SCREEN_FACE && lcdScreen != SCREEN_MUSIC) drawMeter();
   }
 
   if (lcdScreen == SCREEN_FACE) {
     faceTick();    // self-paced animation; owns its own clock + redraws
     delay(2);      // keep the WiFi modem-sleep yield (see note below)
+    return;
+  }
+
+  if (lcdScreen == SCREEN_MUSIC) {
+    musicTick();   // self-paced title marquee; no clock on this layout
+    delay(2);      // keep the WiFi modem-sleep yield
     return;
   }
 
