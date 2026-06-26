@@ -52,7 +52,10 @@ struct FaceFrame { uint16_t hold; int8_t dr, dc; const FacePatch *ops; uint8_t n
 // baseline ascent for its band. Defined up here for the same reason as FaceExpr:
 // Arduino injects auto-prototypes for the functions that take it at the top of
 // the file, so the type must already be visible there.
-struct MusicFace { const GFXfont *latin; const GFXfont *thai; int16_t ascent; };
+// `latinSize` > 0 renders ASCII (English) with the chip's built-in 5x7 font at
+// that integer scale instead of the bundled Ayuthaya Latin GFXfont (`latin`);
+// Thai always blits from `thai`. Set `latinSize` to 0 to fall back to `latin`.
+struct MusicFace { const GFXfont *latin; const GFXfont *thai; int16_t ascent; uint8_t latinSize; };
 
 static const uint8_t EEPROM_MARKER_ADDR = 0;
 static const uint8_t EEPROM_BRIGHTNESS_ADDR = 1;
@@ -2095,10 +2098,21 @@ static void faceTick() {
 // (draw left-aligned, clipped at the edge) if the marquee ever looks wrong.
 #define MUSIC_TITLE_SCROLL 1
 
+// English/ASCII on the MUSIC screen renders with the built-in 5x7 font (the
+// blocky retro look preferred over the proportional Ayuthaya Latin) scaled by
+// these per-face sizes; Thai still blits from thai_font.h. 6*size px per ASCII
+// char, so bigger = chunkier and scrolls sooner. Tune on-device; set a size to
+// 0 to revert that face to its Ayuthaya Latin GFXfont (`.latin`).
+#define MUSIC_TITLE_LATIN_SIZE   3
+#define MUSIC_ARTIST_LATIN_SIZE  2
+// A built-in glyph fills 7 rows above the baseline (rows 0..6 of the 8-row cell),
+// so its top sits at baseline-(7*size-1). Knob if the baseline needs nudging.
+#define MUSIC_LATIN_CAP_ROWS     7
+
 // ascent = max px a glyph rises above the baseline (used to seat the baseline in
 // the band); the values are the per-size maxima measured across both ranges.
-static const MusicFace MUSIC_FACE_TITLE  = { &MusicTitleLatin,  &MusicTitleThai,  37 };
-static const MusicFace MUSIC_FACE_ARTIST = { &MusicArtistLatin, &MusicArtistThai, 28 };
+static const MusicFace MUSIC_FACE_TITLE  = { &MusicTitleLatin,  &MusicTitleThai,  28, MUSIC_TITLE_LATIN_SIZE };
+static const MusicFace MUSIC_FACE_ARTIST = { &MusicArtistLatin, &MusicArtistThai, 22, MUSIC_ARTIST_LATIN_SIZE };
 
 // "Tend" Now Playing (claude.ai/design): a horizontal header row, a vinyl-disc
 // album art on the LEFT with the title + artist meta column to its right, a thin
@@ -2110,9 +2124,10 @@ static const MusicFace MUSIC_FACE_ARTIST = { &MusicArtistLatin, &MusicArtistThai
 // header (eyebrow "NOW PLAYING" left, clock right)
 #define MUSIC_HDR_Y          14    // baseline of the header row
 
-// vinyl disc art (left)
+// vinyl disc art (left). The art + meta + progress block is pulled up to butt
+// against the header (no gap below the status bar) so the lyric band can grow.
 #define MUSIC_ART_X          16
-#define MUSIC_ART_Y          30
+#define MUSIC_ART_Y          24
 #define MUSIC_ART_W          72
 #define MUSIC_ART_H          72
 #define MUSIC_ART_R          12
@@ -2122,20 +2137,21 @@ static const MusicFace MUSIC_FACE_ARTIST = { &MusicArtistLatin, &MusicArtistThai
 // live in this column, not the full width, so they never erase the disc.
 #define MUSIC_META_X         100
 #define MUSIC_META_W         124   // 240 - META_X - PAD
-#define MUSIC_TITLE_BAND_Y   24
-#define MUSIC_TITLE_BAND_H   40
-#define MUSIC_ARTIST_BAND_Y  72
+#define MUSIC_TITLE_BAND_Y   30
+#define MUSIC_TITLE_BAND_H   34
+#define MUSIC_ARTIST_BAND_Y  64
 #define MUSIC_ARTIST_BAND_H  30
 
 // progress + elapsed/-remaining times
-#define MUSIC_PROGRESS_Y     116
-#define MUSIC_TIME_Y         126
+#define MUSIC_PROGRESS_Y     104
+#define MUSIC_TIME_Y         114
 
-// two-line lyric band (bottom): current line in ink, upcoming line dim below
-#define MUSIC_LYRIC_Y        150   // top of the band
-#define MUSIC_LYRIC_H        74    // 150..224
-#define MUSIC_LYRIC1_BASE    180   // current-line baseline (artist face)
-#define MUSIC_LYRIC2_BASE    212   // upcoming-line baseline
+// two-line lyric band (bottom): current line in ink, upcoming line dim below.
+// Grown taller (was 150..224 / 74 px) now that the meta block sits up top.
+#define MUSIC_LYRIC_Y        126   // top of the band
+#define MUSIC_LYRIC_H        98    // 126..224
+#define MUSIC_LYRIC1_BASE    162   // current-line baseline (artist face)
+#define MUSIC_LYRIC2_BASE    200   // upcoming-line baseline
 
 // marquee
 #define MUSIC_SCROLL_PXPS    42    // marquee speed, px/sec
@@ -2170,6 +2186,13 @@ bool musicLyricScrolls1 = false;
 bool musicLyricScrolls2 = false;
 unsigned long musicLyricScrollLastMs = 0;
 unsigned long musicLyricScrollHoldUntilMs = 0;
+// Offscreen buffer for one lyric line. Scrolling Thai lyrics repaint every
+// marquee frame; clear+draw straight to the panel flashes white. Reusing one
+// 240x40 strip keeps each line atomic without pinning a 240x98 band buffer.
+#define MUSIC_LYRIC_SLOT_H   40
+#define MUSIC_LYRIC_TOP_PAD  27
+Arduino_Canvas_Indexed *musicLyricCanvas = nullptr;
+bool musicLyricCanvasOk = false;
 
 static String musicTitleStr() {
   return npTitle.length() ? npTitle : String("- Not Playing -");
@@ -2220,6 +2243,10 @@ static int musicTextWidth(const MusicFace &f, const String &s) {
   unsigned int i = 0;
   while (i < s.length()) {
     uint32_t cp = utf8Next(s, i);
+    if (f.latinSize && cp >= 0x20 && cp <= 0x7E) {   // built-in ASCII: fixed cell
+      w += 6 * f.latinSize;                           // 5px glyph + 1px gap, scaled
+      continue;
+    }
     const GFXfont *gf = musicGlyphFont(f, cp);
     if (!gf) continue;
     const GFXglyph *g = (const GFXglyph *)pgm_read_dword(&gf->glyph) +
@@ -2235,10 +2262,22 @@ static int musicTextWidth(const MusicFace &f, const String &s) {
 // it just mirrors the same draw contract. writePixel clips at target edges.
 static void musicDrawText(Arduino_GFX *target, const MusicFace &f, int x, int baselineY,
                           const String &s, uint16_t fg) {
+  // ASCII top for the built-in font seats its 7-row glyph on the shared baseline.
+  const int latinTop = baselineY - (MUSIC_LATIN_CAP_ROWS * f.latinSize - 1);
+  if (f.latinSize) { target->setFont(NULL); target->setTextSize(f.latinSize); }
   target->startWrite();
   unsigned int i = 0;
   while (i < s.length()) {
     uint32_t cp = utf8Next(s, i);
+    if (f.latinSize && cp >= 0x20 && cp <= 0x7E) {   // built-in ASCII glyph
+      // drawChar manages its own transaction; close ours around it (no-op on the
+      // RAM canvases, balanced on the direct-panel fallback). bg==fg => transparent.
+      target->endWrite();
+      target->drawChar(x, latinTop, (unsigned char)cp, fg, fg);
+      target->startWrite();
+      x += 6 * f.latinSize;
+      continue;
+    }
     const GFXfont *gf = musicGlyphFont(f, cp);
     if (!gf) continue;
     const GFXglyph *g = (const GFXglyph *)pgm_read_dword(&gf->glyph) +
@@ -2261,6 +2300,7 @@ static void musicDrawText(Arduino_GFX *target, const MusicFace &f, int x, int ba
     x += xa;
   }
   target->endWrite();
+  if (f.latinSize) target->setTextSize(1);   // restore default for other text draws
 }
 
 static void musicLayoutTitle() {
@@ -2283,13 +2323,18 @@ static void musicLayoutArtist() {
   musicArtistScrollHoldUntilMs = millis() + MUSIC_SCROLL_HOLD_MS;
 }
 
-// Title/artist are left-aligned in the meta column to the right of the disc.
-// `baseX` is the column's left in TARGET coords: 0 for the column canvas (whose
-// origin is already MUSIC_META_X), or MUSIC_META_X for the gfx fallback. When a
-// line is wider than the column it scrolls; a second copy one gap past the first
-// makes the marquee wrap seamlessly. writePixel clips glyphs at the column edge.
+static int musicCenteredX(int boxW, int textW, int minX = 0) {
+  int x = (boxW - textW) / 2;
+  return x > minX ? x : minX;
+}
+
+// Title/artist sit in the meta column to the right of the disc. `baseX` is the
+// column's left in TARGET coords: 0 for the column canvas (whose origin is
+// already MUSIC_META_X), or MUSIC_META_X for the gfx fallback. Short lines are
+// centered; long lines scroll, with a second copy one gap past the first so the
+// marquee wraps seamlessly. writePixel clips glyphs at the column edge.
 static void musicBlitTitle(Arduino_GFX *target, int baseX, int baseline) {
-  int x = baseX + (musicTitleScrolls ? -musicScrollX : 0);
+  int x = baseX + (musicTitleScrolls ? -musicScrollX : musicCenteredX(MUSIC_META_W, musicTitleW));
   musicDrawText(target, MUSIC_FACE_TITLE, x, baseline, musicTitleStr(), C_MUS_INK);
   if (musicTitleScrolls)
     musicDrawText(target, MUSIC_FACE_TITLE, x + musicTitleW + MUSIC_SCROLL_GAP,
@@ -2297,7 +2342,7 @@ static void musicBlitTitle(Arduino_GFX *target, int baseX, int baseline) {
 }
 
 static void musicBlitArtist(Arduino_GFX *target, int baseX, int baseline) {
-  int x = baseX + (musicArtistScrolls ? -musicArtistScrollX : 0);
+  int x = baseX + (musicArtistScrolls ? -musicArtistScrollX : musicCenteredX(MUSIC_META_W, musicArtistW));
   musicDrawText(target, MUSIC_FACE_ARTIST, x, baseline, npArtist, C_MUS_INK_SOFT);
   if (musicArtistScrolls)
     musicDrawText(target, MUSIC_FACE_ARTIST, x + musicArtistW + MUSIC_SCROLL_GAP,
@@ -2490,10 +2535,11 @@ static bool musicLyricUsesCompact(const String &s) {
   return musicShouldCompactLyric(s, compact);
 }
 
-static void musicDrawCompactAsciiLyric(int y, const String &s, uint16_t fg) {
+static void musicDrawCompactAsciiLyric(Arduino_GFX *target, int y, const String &s, uint16_t fg) {
   const int maxChars = (240 - MUSIC_PAD * 2) / 6;  // default GFX font, textSize 1
-  gfx->setTextSize(1);
-  gfx->setTextColor(fg, C_MUS_PAPER);
+  target->setFont(NULL);
+  target->setTextSize(1);
+  target->setTextColor(fg, C_MUS_PAPER);
 
   String rest = s;
   for (int row = 0; row < 3 && rest.length(); row++) {
@@ -2517,23 +2563,27 @@ static void musicDrawCompactAsciiLyric(int y, const String &s, uint16_t fg) {
       rest = "";
     }
     if ((int)line.length() > maxChars) line = line.substring(0, maxChars);
-    gfx->setCursor(MUSIC_PAD, y + row * 10);
-    gfx->print(line);
+    target->setCursor(musicCenteredX(240, line.length() * 6, MUSIC_PAD), y + row * 10);
+    target->print(line);
   }
 }
 
-static void musicDrawLyricLine(const String &s, int baseline, uint16_t fg,
+// Draw one lyric line into `target`. `yOff` translates absolute screen baselines
+// into the target's coordinate space: 0 for the panel, MUSIC_LYRIC_Y for the band
+// canvas (whose origin is the band top).
+static void musicDrawLyricLine(Arduino_GFX *target, int yOff, const String &s,
+                               int baseline, uint16_t fg,
                                int scrollX, int textW, bool scrolls) {
   String compact;
   if (musicShouldCompactLyric(s, compact)) {
-    musicDrawCompactAsciiLyric(baseline - 27, compact, fg);
+    musicDrawCompactAsciiLyric(target, baseline - yOff - 27, compact, fg);
     return;
   }
-  int x = MUSIC_PAD + (scrolls ? -scrollX : 0);
-  musicDrawText(gfx, MUSIC_FACE_ARTIST, x, baseline, s, fg);
+  int x = scrolls ? MUSIC_PAD - scrollX : musicCenteredX(240, textW, MUSIC_PAD);
+  musicDrawText(target, MUSIC_FACE_ARTIST, x, baseline - yOff, s, fg);
   if (scrolls)
-    musicDrawText(gfx, MUSIC_FACE_ARTIST, x + textW + MUSIC_SCROLL_GAP,
-                  baseline, s, fg);
+    musicDrawText(target, MUSIC_FACE_ARTIST, x + textW + MUSIC_SCROLL_GAP,
+                  baseline - yOff, s, fg);
 }
 
 static void musicLayoutLyrics(const String &l1, const String &l2) {
@@ -2547,14 +2597,37 @@ static void musicLayoutLyrics(const String &l1, const String &l2) {
   musicLyricScrollHoldUntilMs = millis() + MUSIC_SCROLL_HOLD_MS;
 }
 
+static bool musicEnsureLyricCanvas() {
+  if (musicLyricCanvasOk) return true;
+  if (!musicLyricCanvas) {
+    musicLyricCanvas = new Arduino_Canvas_Indexed(
+        240, MUSIC_LYRIC_SLOT_H, gfx, 0, 0);
+    if (!musicLyricCanvas) return false;
+  }
+  musicLyricCanvasOk = musicLyricCanvas->begin(GFX_SKIP_OUTPUT_BEGIN);
+  return musicLyricCanvasOk;
+}
+
+static void musicPaintLyricSlot(const String &s, int baseline, uint16_t fg,
+                                int scrollX, int textW, bool scrolls) {
+  int y = baseline - MUSIC_LYRIC_TOP_PAD;
+  if (musicEnsureLyricCanvas()) {
+    musicLyricCanvas->fillScreen(C_MUS_PAPER);
+    musicDrawLyricLine(musicLyricCanvas, y, s, baseline, fg, scrollX, textW, scrolls);
+    gfx->drawIndexedBitmap(0, y, musicLyricCanvas->getFramebuffer(),
+                           musicLyricCanvas->getColorIndex(),
+                           240, MUSIC_LYRIC_SLOT_H);
+  } else {
+    gfx->fillRect(0, y, 240, MUSIC_LYRIC_SLOT_H, C_MUS_PAPER);
+    musicDrawLyricLine(gfx, 0, s, baseline, fg, scrollX, textW, scrolls);
+  }
+}
+
 static void musicPaintLyrics() {
-  gfx->fillRect(0, MUSIC_LYRIC_Y, 240, MUSIC_LYRIC_H, C_MUS_PAPER);
-  if (musicLyricShown1.length())
-    musicDrawLyricLine(musicLyricShown1, MUSIC_LYRIC1_BASE, C_MUS_INK,
-                       musicLyricScrollX1, musicLyricW1, musicLyricScrolls1);
-  if (musicLyricShown2.length())
-    musicDrawLyricLine(musicLyricShown2, MUSIC_LYRIC2_BASE, C_MUS_INK_MUTED,
-                       musicLyricScrollX2, musicLyricW2, musicLyricScrolls2);
+  musicPaintLyricSlot(musicLyricShown1, MUSIC_LYRIC1_BASE, C_MUS_INK,
+                      musicLyricScrollX1, musicLyricW1, musicLyricScrolls1);
+  musicPaintLyricSlot(musicLyricShown2, MUSIC_LYRIC2_BASE, C_MUS_INK_MUTED,
+                      musicLyricScrollX2, musicLyricW2, musicLyricScrolls2);
 }
 
 // Two-line lyric band at the bottom (the user's deviation from the source design,
