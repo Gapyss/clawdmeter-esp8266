@@ -242,6 +242,30 @@ The plist uses absolute paths and `/usr/bin/python3`; update both if the project
 moves or the Python changes. Run the daemon by hand once first so the Keychain
 prompt is approved (launchd can't answer GUI dialogs).
 
+**Add lyrics by hand (songs lrclib.net doesn't have):** `daemon/tools/add_lyrics.py`
+writes an entry into the on-demand cache (`CLAWDMETER_LYRIC_CACHE`,
+default `~/.clawdmeter/lyrics.sqlite3`), reusing the daemon's own
+`lyric_key`/`lyric_cache_put` so the key always matches a real now-playing lookup.
+```sh
+# synced .lrc (auto-detected by [mm:ss.xx] stamps); duration accepts seconds or M:SS
+python3 daemon/tools/add_lyrics.py --title "Song" --artist "Band" --duration 3:35 --lrc song.lrc
+pbpaste | python3 daemon/tools/add_lyrics.py --title "Song" --duration 214      # plain via stdin
+python3 daemon/tools/add_lyrics.py --title "Interlude" --duration 92 --instrumental
+python3 daemon/tools/add_lyrics.py --list                                       # show cached entries
+```
+**The key includes the track length in whole seconds and is derived live, not from
+what you type** — `dur = floor(YT Music progress-bar aria-valuemax)`, the **artist
+is often empty**, and a `(ร่วมกับ …)`/`(feat …)` suffix is **part of the title**.
+Guessing wrong = permanent miss. So capture the real key while the song plays:
+```sh
+python3 -c "import importlib.util as u; m=u.module_from_spec(s:=u.spec_from_file_location('d','daemon/claudemeter_daemon.py')); s.loader.exec_module(m); print(m.read_now_playing())"
+#   -> (title, artist, pos, dur, paused)  — pass that title/artist/dur to add_lyrics.py
+```
+Title/artist are whitespace/case-normalized, so only the *shape* (empty artist,
+feat. in title) and the duration must match. The **running** daemon checks its
+in-memory `LRCLIB_CACHE` before disk, so if it already cached a miss this session,
+restart it to pick up a freshly inserted entry.
+
 ## Constants worth knowing before editing
 
 - Display pins / SPI / rotation / default brightness: `#define`s at the top of
@@ -254,7 +278,22 @@ prompt is approved (launchd can't answer GUI dialogs).
   (device push retry tuning),
   `CLAWDMETER_USAGE_SOURCE` (`api` or `local`),
   `CLAWDMETER_SESSION_TOKEN_LIMIT` / `CLAWDMETER_WEEKLY_TOKEN_LIMIT`
-  (token budgets the progress bars represent in `local` mode; defaults 30M / 100M).
+  (token budgets the progress bars represent in `local` mode; defaults 30M / 100M),
+  `CLAWDMETER_LRCLIB_DB` (path to a downloaded lrclib SQLite dump from
+  https://lrclib.net/db-dumps — when set, music lyrics are looked up locally via
+  the stdlib `sqlite3` instead of `lrclib.net`: offline, sub-ms, no rate limits.
+  `lrclib_json` dispatches `/api/get`/`/api/search` to the dump — exact `name_lower`
+  match (+/-2s duration) then an FTS5 fuzzy fallback — and returns the same camelCase
+  JSON shape as the API, so `fetch_lyrics` is unchanged. A clean miss stays local;
+  only a sqlite *error* falls back to the network),
+  `CLAWDMETER_LYRIC_CACHE` (path to a persistent on-demand lyric cache, default
+  `~/.clawdmeter/lyrics.sqlite3` — set empty to disable). Every song fetched from
+  lrclib.net is written through to this tiny SQLite (grows only with songs actually
+  played), and `fetch_lyrics` reads it before the in-memory `LRCLIB_CACHE` misses to
+  the network — so replays are offline/instant and the cache survives daemon
+  restarts. Only real results are stored; "none found" stays session-only so a song
+  missing today can be picked up later. This is the no-download alternative to the
+  full `CLAWDMETER_LRCLIB_DB` dump and coexists with it.
 - The compiled `.bin` is built for `nodemcuv2` (4 MB flash) with the `mmu=4816`
   and `ip=hb2f` options. A 1 MB board (e.g. ESP-01) needs a different FQBN/flash
   layout for OTA. Don't drop `ip=hb2f` — it's what makes the 15 KB dashboard load

@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -275,6 +276,27 @@ LRCLIB_USER_AGENT = os.environ.get(
     "CLAWDMETER_LRCLIB_USER_AGENT",
     "Clawdmeter/1.0 (https://github.com/HermannBjorgvin/Clawdmeter)",
 )
+# Optional: path to a downloaded lrclib SQLite dump (https://lrclib.net/db-dumps).
+# When set and valid, lyric lookups are served locally (offline, sub-ms, no rate
+# limits) instead of hitting lrclib.net. A clean miss stays local (offline intent);
+# only a sqlite *error* falls back to the network path.
+LRCLIB_DB_PATH = os.environ.get("CLAWDMETER_LRCLIB_DB", "").strip()
+_LRCLIB_DB = None             # cached read-only sqlite3.Connection
+_LRCLIB_DB_DISABLED = False   # set once if the dump is missing/unusable
+# Columns the lrclib dump's `tracks` table must have for our queries to work.
+_LRCLIB_TRACK_COLS = {
+    "name", "name_lower", "artist_name", "artist_name_lower",
+    "duration", "last_lyrics_id",
+}
+# Persistent on-demand lyric cache: every song fetched from lrclib.net is saved
+# here, so replays are offline/instant and the in-memory cache survives restarts.
+# Grows only with songs actually played (a few MB), unlike the full ~80 GB dump.
+# Set the env var to empty to disable.
+LYRIC_CACHE_PATH = os.environ.get(
+    "CLAWDMETER_LYRIC_CACHE", str(Path.home() / ".clawdmeter" / "lyrics.sqlite3")
+).strip()
+_LYRIC_CACHE_DB = None
+_LYRIC_CACHE_DISABLED = False
 NOWPLAYING_SCRIPT = (
     'tell application "System Events"\n'
     '  if not ((name of processes) contains "Google Chrome") then return ""\n'
@@ -480,7 +502,100 @@ def lyrics_from_lrclib_payload(payload):
     return {"synced": synced, "plain": plain, "instrumental": False}
 
 
-def lrclib_json(endpoint, params):
+def lrclib_db():
+    """Return a cached read-only connection to the local lrclib dump, or None.
+
+    Returns None (and warns once) when no dump is configured, the file is
+    missing, or the schema doesn't look like an lrclib dump — callers then fall
+    back to the HTTP API. Opened with mode=ro&immutable=1: the dump is a static
+    snapshot, so this skips lock files / -wal handling and works on read-only
+    media.
+    """
+    global _LRCLIB_DB, _LRCLIB_DB_DISABLED
+    if _LRCLIB_DB_DISABLED or not LRCLIB_DB_PATH:
+        return None
+    if _LRCLIB_DB is not None:
+        return _LRCLIB_DB
+    try:
+        if not os.path.exists(LRCLIB_DB_PATH):
+            raise FileNotFoundError(LRCLIB_DB_PATH)
+        uri = f"file:{urllib.request.pathname2url(LRCLIB_DB_PATH)}?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(tracks)")}
+        if not _LRCLIB_TRACK_COLS.issubset(cols):
+            raise sqlite3.DatabaseError(f"unexpected tracks schema: {sorted(cols)}")
+        conn.execute("PRAGMA mmap_size=30000000000")  # memory-map; no row copies
+        conn.row_factory = sqlite3.Row
+        _LRCLIB_DB = conn
+        print(f"lrclib: serving lyrics from local dump {LRCLIB_DB_PATH}")
+        return _LRCLIB_DB
+    except (OSError, sqlite3.Error) as e:
+        _LRCLIB_DB_DISABLED = True
+        print(f"lrclib: local dump unavailable ({e}); using network", file=sys.stderr)
+        return None
+
+
+def _lrclib_row_payload(row):
+    """Shape a (tracks JOIN lyrics) row like an lrclib.net API JSON object."""
+    return {
+        "trackName": row["name"],
+        "artistName": row["artist_name"],
+        "duration": row["duration"],
+        "syncedLyrics": row["synced_lyrics"],
+        "plainLyrics": row["plain_lyrics"],
+        "instrumental": bool(row["instrumental"]),
+    }
+
+
+_LRCLIB_SELECT = (
+    "SELECT t.name, t.artist_name, t.duration, "
+    "l.synced_lyrics, l.plain_lyrics, l.instrumental "
+)
+# Word runs, Unicode-aware. Thai has no word spaces so a Thai title is one token;
+# fuzzy FTS search on it is weak (unicode61 doesn't segment Thai) — but the exact
+# name_lower= path below carries Thai fine, and that's the common case anyway.
+_FTS_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+
+
+def lrclib_db_get(conn, params):
+    """Local equivalent of GET /api/get: exact title (+artist, +/-2s duration)."""
+    name = (params.get("track_name") or "").strip().lower()
+    if not name:
+        return None
+    sql = _LRCLIB_SELECT + "FROM tracks t JOIN lyrics l ON l.id = t.last_lyrics_id WHERE t.name_lower = ?"
+    args = [name]
+    artist = (params.get("artist_name") or "").strip().lower()
+    if artist:
+        sql += " AND t.artist_name_lower = ?"
+        args.append(artist)
+    dur = params.get("duration")
+    if dur not in (None, "", -1):
+        # lrclib's get tolerates ~2s; pick the closest within tolerance.
+        sql += " AND ABS(t.duration - ?) <= 2 ORDER BY ABS(t.duration - ?) LIMIT 1"
+        args += [float(dur), float(dur)]
+    else:
+        sql += " LIMIT 1"
+    row = conn.execute(sql, args).fetchone()
+    return _lrclib_row_payload(row) if row else None
+
+
+def lrclib_db_search(conn, params):
+    """Local equivalent of GET /api/search: FTS5 over title+artist, bm25-ranked."""
+    terms = f"{params.get('track_name') or ''} {params.get('artist_name') or ''}"
+    tokens = _FTS_TOKEN_RE.findall(terms.lower())
+    if not tokens:
+        return []
+    match = " OR ".join('"' + t.replace('"', "") + '"' for t in tokens)
+    sql = (
+        _LRCLIB_SELECT
+        + "FROM tracks_fts f JOIN tracks t ON t.id = f.rowid "
+        "JOIN lyrics l ON l.id = t.last_lyrics_id "
+        "WHERE tracks_fts MATCH ? ORDER BY rank LIMIT 20"
+    )
+    return [_lrclib_row_payload(r) for r in conn.execute(sql, (match,)).fetchall()]
+
+
+def _lrclib_http(endpoint, params):
     query = urllib.parse.urlencode(
         {k: v for k, v in params.items() if v not in ("", None, -1)}
     )
@@ -498,6 +613,24 @@ def lrclib_json(endpoint, params):
         if e.code == 404:
             return None
         raise
+
+
+def lrclib_json(endpoint, params):
+    """Dispatch a lrclib lookup to the local dump if configured, else the API.
+
+    A clean local miss returns None/[] and stays offline; a sqlite *error* falls
+    through to the network so a corrupt/locked dump never breaks lyrics.
+    """
+    conn = lrclib_db()
+    if conn is not None:
+        try:
+            if endpoint == "/api/get":
+                return lrclib_db_get(conn, params)
+            if endpoint == "/api/search":
+                return lrclib_db_search(conn, params)
+        except sqlite3.Error as e:
+            print(f"lrclib: local query failed ({e}); using network", file=sys.stderr)
+    return _lrclib_http(endpoint, params)
 
 
 def lrclib_score(candidate, title, artist, dur):
@@ -530,6 +663,78 @@ def lrclib_score(candidate, title, artist, dur):
     return score
 
 
+def lyric_cache_db():
+    """Lazily open (creating if needed) the persistent on-demand lyric cache.
+
+    Returns a sqlite3 connection, or None if disabled / unwritable (warn once,
+    then callers just skip the cache and use the network as before).
+    """
+    global _LYRIC_CACHE_DB, _LYRIC_CACHE_DISABLED
+    if _LYRIC_CACHE_DISABLED or not LYRIC_CACHE_PATH:
+        return None
+    if _LYRIC_CACHE_DB is not None:
+        return _LYRIC_CACHE_DB
+    try:
+        Path(LYRIC_CACHE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(LYRIC_CACHE_PATH, check_same_thread=False)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS lyrics_cache ("
+            "key TEXT PRIMARY KEY, track TEXT, artist TEXT, duration REAL, "
+            "synced_lyrics TEXT, plain_lyrics TEXT, instrumental INTEGER, updated REAL)"
+        )
+        conn.commit()
+        _LYRIC_CACHE_DB = conn
+        return _LYRIC_CACHE_DB
+    except (OSError, sqlite3.Error) as e:
+        _LYRIC_CACHE_DISABLED = True
+        print(f"lyric cache disabled ({e}); using network only", file=sys.stderr)
+        return None
+
+
+def _lyric_cache_key(key):
+    # lyric_key() is a (title, artist, dur) tuple; \x1f can't occur in the text.
+    return "\x1f".join((key[0], key[1], str(key[2])))
+
+
+def lyric_cache_get(key):
+    conn = lyric_cache_db()
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT synced_lyrics, plain_lyrics, instrumental FROM lyrics_cache WHERE key = ?",
+            (_lyric_cache_key(key),),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return lyrics_from_lrclib_payload(
+        {"syncedLyrics": row[0], "plainLyrics": row[1], "instrumental": bool(row[2])}
+    )
+
+
+def lyric_cache_put(key, payload):
+    conn = lyric_cache_db()
+    if conn is None or not isinstance(payload, dict):
+        return
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO lyrics_cache "
+            "(key, track, artist, duration, synced_lyrics, plain_lyrics, instrumental, updated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _lyric_cache_key(key),
+                payload.get("trackName"), payload.get("artistName"), payload.get("duration"),
+                payload.get("syncedLyrics"), payload.get("plainLyrics"),
+                int(bool(payload.get("instrumental"))), time.time(),
+            ),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        print(f"lyric cache write failed ({e})", file=sys.stderr)
+
+
 def fetch_lyrics(title, artist, dur):
     """Return cached parsed lyrics for the current song, fetching from lrclib if needed."""
     global LRCLIB_WARNED
@@ -538,6 +743,10 @@ def fetch_lyrics(title, artist, dur):
         return empty_lyrics()
     if key in LRCLIB_CACHE:
         return LRCLIB_CACHE[key]
+    cached = lyric_cache_get(key)
+    if cached is not None:
+        LRCLIB_CACHE[key] = cached
+        return cached
     fail_at = LRCLIB_FAIL.get(key)
     if fail_at is not None and time.monotonic() - fail_at < LRCLIB_RETRY_BACKOFF:
         return empty_lyrics()
@@ -567,6 +776,10 @@ def fetch_lyrics(title, artist, dur):
     LRCLIB_FAIL.pop(key, None)
     parsed = lyrics_from_lrclib_payload(payload)
     LRCLIB_CACHE[key] = parsed
+    # Persist real results only — never cache "none found", so a song missing
+    # today can still be picked up later (negative results stay session-only).
+    if parsed["instrumental"] or parsed["synced"] or parsed["plain"]:
+        lyric_cache_put(key, payload)
     if parsed["instrumental"]:
         kind = "instrumental"
     elif parsed["synced"]:
