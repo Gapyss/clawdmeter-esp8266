@@ -145,6 +145,9 @@ int npPos = -1;                  // current playback position, seconds
 int npDur = -1;                  // total track duration, seconds
 int npPaused = -1;               // -1 unknown, 0 playing, 1 paused
 unsigned long npPosBaseMs = 0;   // millis() when npPos was received
+String npLyric = "";             // current lyric line (UTF-8, daemon-pushed from lrclib)
+String npLyric2 = "";            // upcoming lyric line (shown dim below the current one)
+int npLyricAt = -1;              // playback pos (s) at which npLyric2 promotes to current; -1 = none
 bool musicChromeReady = false;   // MUSIC chrome is static; pushes repaint title/artist only
 bool otaInProgress = false;     // true while /update is writing firmware
 bool otaUpdateOk = false;
@@ -215,8 +218,12 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <main>
 <header>
   <div><h1 id="title">Clawdmeter</h1><div class="sub" id="subtitle">Claude usage monitor</div></div>
-  <div class="status"><span class="dot" id="dot"></span><span id="status">connecting...</span><a class="btn" id="switchMode" href="?view=mac">Mac</a></div>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">connecting...</span><a class="btn" id="npToggle" href="#">&#9835; Now Playing</a><a class="btn" id="switchMode" href="?view=mac">Mac</a></div>
 </header>
+<section class="panel" id="npPanel" style="display:none">
+  <div class="label"><span class="name">Now Playing</span><span class="muted" id="npArtist">--</span></div>
+  <div class="v" id="npTitle">- Not Playing -</div>
+</section>
 <section class="grid">
   <div class="panel meter" id="sessionCard">
     <div class="label"><span class="name" id="sessionName">Session window</span><span class="pct" id="sp">--</span></div>
@@ -285,6 +292,13 @@ document.getElementById('switchMode').onclick=function(e){
   view=view=='claude'?'mac':view=='mac'?'desk':view=='desk'?'face':'claude';
   saveView(view);
   tick();
+};
+document.getElementById('npToggle').onclick=function(e){
+  if(e&&e.preventDefault)e.preventDefault();
+  var p=document.getElementById('npPanel');
+  var show=p.style.display=='none';
+  p.style.display=show?'':'none';
+  if(show)fetch('/mode?screen=music',{cache:'no-store'}).catch(function(e){});
 };
 function setDeskUi(status){
   document.getElementById('deskValue').textContent=status?status.toUpperCase():'--';
@@ -369,6 +383,9 @@ async function tick(){
     document.getElementById('age').textContent=ageText(d.age);
     var live=d.age>=0&&d.age<=120;
     document.body.className=live?'':'stale';
+    var npt=(d.title||'').trim();
+    document.getElementById('npTitle').textContent=npt||'- Not Playing -';
+    document.getElementById('npArtist').textContent=d.artist||'';
     if(view=='desk'){
       document.getElementById('title').textContent='Desk Status';
       document.getElementById('subtitle').textContent='Physical status sign';
@@ -599,6 +616,8 @@ void handleUsageJson() {
              ",\"face\":\"" + String(faceModeName()) + "\"" +
              ",\"title\":\"" + jsonEscape(npTitle) + "\"" +
              ",\"artist\":\"" + jsonEscape(npArtist) + "\"" +
+             ",\"lyric\":\"" + jsonEscape(npLyric) + "\"" +
+             ",\"lyric2\":\"" + jsonEscape(npLyric2) + "\"" +
              ",\"pos\":" + String(musicDisplayPos()) +
              ",\"dur\":" + String(npDur) +
              ",\"paused\":" + String(npPaused) +
@@ -659,15 +678,19 @@ void handleMode() {
 }
 
 // Daemon pushes the current YouTube Music song here:
-// POST /nowplaying?title=<urlenc UTF-8>&artist=<urlenc UTF-8>&pos=&dur=&paused=
-// Updates the stored song without stealing focus from other screens. If MUSIC is
-// the current screen, track/pause changes repaint the content; position-only
-// resyncs repaint just the footer.
+// POST /nowplaying?title=<urlenc UTF-8>&artist=<urlenc UTF-8>&pos=&dur=&paused=&lyric=&lyric2=&lt=
+// Stores the song WITHOUT stealing focus: now-playing is a web-only feature
+// (the dashboard's Now Playing panel reads it from /usage.json). The physical
+// MUSIC screen is manual-only — selected via /mode?screen=music. If MUSIC happens
+// to be the current screen, track/pause changes repaint the content; position/lyric
+// resyncs repaint just the progress/time footer and lyric band.
 void handleNowPlaying() {
   String oldTitle = npTitle;
   String oldArtist = npArtist;
   int oldDur = npDur;
   int oldPaused = npPaused;
+  String oldLyric = npLyric;
+  String oldLyric2 = npLyric2;
   if (server.hasArg("title")) npTitle = server.arg("title");
   if (server.hasArg("artist")) npArtist = server.arg("artist");
   if (server.hasArg("pos")) {
@@ -676,16 +699,27 @@ void handleNowPlaying() {
   }
   if (server.hasArg("dur")) npDur = server.arg("dur").toInt();
   if (server.hasArg("paused")) npPaused = constrain(server.arg("paused").toInt(), -1, 1);
-  if (npTitle.length() && lcdScreen != SCREEN_MUSIC) {
-    lcdScreen = SCREEN_MUSIC;
-    musicChromeReady = false;
-    lastTickEpoch = 0;
+  bool identityChanged = oldTitle != npTitle || oldArtist != npArtist || oldDur != npDur;
+  if (server.hasArg("lyric")) {
+    npLyric = server.arg("lyric");
+    npLyric2 = server.hasArg("lyric2") ? server.arg("lyric2") : String("");
+    npLyricAt = server.hasArg("lt") ? server.arg("lt").toInt() : -1;
+  } else if (identityChanged) {
+    npLyric = "";
+    npLyric2 = "";
+    npLyricAt = -1;
   }
   if (lcdScreen == SCREEN_MUSIC) {
-    bool identityChanged = oldTitle != npTitle || oldArtist != npArtist || oldDur != npDur;
+    if (identityChanged) {
+      npPos = 0;
+      npPosBaseMs = millis();
+    }
     bool pausedChanged = oldPaused != npPaused;
     if (identityChanged || pausedChanged) drawMusic();
-    else musicDrawFooter();
+    else {
+      musicDrawFooter();
+      if (oldLyric != npLyric || oldLyric2 != npLyric2) musicDrawLyrics();
+    }
   }
   server.sendHeader("Connection", "close");
   server.send(200, "text/plain", "ok");
@@ -813,6 +847,21 @@ void handleFactoryReset() {
 #define C_INK    0x18E3   // warm near-black text / headline number (#1F1E1D-ish)
 #define C_TAN    0xEF5C   // bar track / soft fills (#EDE9E0)
 #define C_MUTE   0x8C92   // warm taupe for secondary labels on cream (#8A8578-ish)
+
+// MUSIC screen — "Tend" warm-paper palette (claude.ai/design Now Playing card).
+// Cream paper surface, deep-olive ink, ember accent, warm bark vinyl disc.
+#define C_MUS_PAPER      0xFF9C  // #F8F3E1 primary surface (cream)
+#define C_MUS_PAPER_DEEP 0xEF39  // #EDE6CB sunken surface / progress track
+#define C_MUS_PAPER_SOFT 0xFFDE  // #FDFBF2 raised surface / vinyl label ring
+#define C_MUS_PAPER_LINE 0xD654  // #D3C8A2 hairline border on paper
+#define C_MUS_INK        0x18E2  // #1F1D11 primary text (title / current lyric)
+#define C_MUS_INK_SOFT   0x5AA6  // #5B5536 secondary text (artist)
+#define C_MUS_INK_MUTED  0x946D  // #948D6F tertiary (eyebrow / clock / times / next lyric)
+#define C_MUS_INK_FAINT  0xC5F2  // #C5BD96 disabled / placeholder
+#define C_MUS_EMBER      0xEAE7  // #E85D3C primary accent (progress fill, vinyl label)
+#define C_MUS_EMBER_DEEP 0xC203  // #C2421F pressed ember
+#define C_MUS_BARK       0x8B68  // #8B6F47 vinyl disc rings (warm earth)
+#define C_MUS_BARK_DEEP  0x6A86  // #6B5236 vinyl disc grooves
 
 // Display clock/reset times in Thailand time. Pushed epochs are UTC; add the
 // offset only when formatting wall-clock text (durations/countdowns stay raw).
@@ -2048,21 +2097,44 @@ static void faceTick() {
 static const MusicFace MUSIC_FACE_TITLE  = { &MusicTitleLatin,  &MusicTitleThai,  37 };
 static const MusicFace MUSIC_FACE_ARTIST = { &MusicArtistLatin, &MusicArtistThai, 28 };
 
-// Record dimensions — center top half, leave room for title/artist/footer below
-#define REC_CX           120
-#define REC_CY           56     // record centre Y; disc spans y=4..108
-#define REC_R            52     // outer vinyl radius
-#define REC_LABEL_R      20     // label circle radius
-#define REC_DOT_R        15     // spin-indicator dot orbit radius (on the label)
-#define REC_GROOVE_STEP   4     // px between groove rings
-#define REC_RPM          33.3f  // visual rotation speed
-#define REC_FRAME_MS     67     // ~15 fps spin updates
+// "Tend" Now Playing (claude.ai/design): a horizontal header row, a vinyl-disc
+// album art on the LEFT with the title + artist meta column to its right, a thin
+// ember progress bar, and — per the user's deviation from the source design — a
+// two-line LYRIC band filling the bottom where the transport controls would be.
 
-// Layout: title starts below the disc + small gap
-#define MUSIC_TITLE_BAND_Y   111
-#define MUSIC_TITLE_BAND_H   52    // room for full Thai mark stacks at title size
-#define MUSIC_ARTIST_BAND_Y  165
-#define MUSIC_ARTIST_BAND_H  38
+#define MUSIC_PAD            16    // outer paper margin
+
+// header (eyebrow "NOW PLAYING" left, clock right)
+#define MUSIC_HDR_Y          14    // baseline of the header row
+
+// vinyl disc art (left)
+#define MUSIC_ART_X          16
+#define MUSIC_ART_Y          30
+#define MUSIC_ART_W          72
+#define MUSIC_ART_H          72
+#define MUSIC_ART_R          12
+#define MUSIC_LABEL_R        11    // ember center label (22 px dia)
+
+// meta column (title + artist marquees), right of the art. The marquee canvases
+// live in this column, not the full width, so they never erase the disc.
+#define MUSIC_META_X         100
+#define MUSIC_META_W         124   // 240 - META_X - PAD
+#define MUSIC_TITLE_BAND_Y   24
+#define MUSIC_TITLE_BAND_H   40
+#define MUSIC_ARTIST_BAND_Y  72
+#define MUSIC_ARTIST_BAND_H  30
+
+// progress + elapsed/-remaining times
+#define MUSIC_PROGRESS_Y     116
+#define MUSIC_TIME_Y         126
+
+// two-line lyric band (bottom): current line in ink, upcoming line dim below
+#define MUSIC_LYRIC_Y        150   // top of the band
+#define MUSIC_LYRIC_H        74    // 150..224
+#define MUSIC_LYRIC1_BASE    180   // current-line baseline (artist face)
+#define MUSIC_LYRIC2_BASE    212   // upcoming-line baseline
+
+// marquee
 #define MUSIC_SCROLL_PXPS    42    // marquee speed, px/sec
 #define MUSIC_SCROLL_STEP_PX 2     // 2px frames ~=21 FPS, leaves WiFi loop headroom
 #define MUSIC_TITLE_PAD      4
@@ -2076,12 +2148,25 @@ unsigned long musicTimeLastMs = 0;
 int  musicTitleW = 0;              // measured title width (sum of glyph advances)
 int  musicArtistW = 0;
 bool musicTitleScrolls = false;    // title wider than the panel -> animate
-float recordAngle = 0.0f;          // current spin angle in radians
-unsigned long recordLastMs = 0;
+int  musicClockMin = -1;           // last header-clock minute drawn (-1 = none yet)
 Arduino_Canvas_Indexed *musicTitleCanvas = nullptr;
 bool musicTitleCanvasOk = false;
 Arduino_Canvas_Indexed *musicArtistCanvas = nullptr;
 bool musicArtistCanvasOk = false;
+bool musicArtistScrolls = false;   // artist wider than panel -> animate
+int  musicArtistScrollX = 0;
+unsigned long musicArtistScrollLastMs = 0;
+unsigned long musicArtistScrollHoldUntilMs = 0;
+String musicLyricShown1 = "\x01";  // last lyric lines painted (sentinel forces first draw)
+String musicLyricShown2 = "\x01";
+int  musicLyricScrollX1 = 0;
+int  musicLyricScrollX2 = 0;
+int  musicLyricW1 = 0;
+int  musicLyricW2 = 0;
+bool musicLyricScrolls1 = false;
+bool musicLyricScrolls2 = false;
+unsigned long musicLyricScrollLastMs = 0;
+unsigned long musicLyricScrollHoldUntilMs = 0;
 
 static String musicTitleStr() {
   return npTitle.length() ? npTitle : String("- Not Playing -");
@@ -2175,51 +2260,52 @@ static void musicDrawText(Arduino_GFX *target, const MusicFace &f, int x, int ba
   target->endWrite();
 }
 
-// Plain ASCII printer for the built-in 5x7 font, used only for the chrome labels.
-static void musicPrintAt(int x, int y, uint8_t size, const String &s,
-                         uint16_t fg, uint16_t bg) {
-  gfx->setTextSize(size);
-  gfx->setTextColor(fg, bg);
-  gfx->setCursor(x, y);
-  gfx->print(s);
-}
-
 static void musicLayoutTitle() {
   musicTitleW = musicTextWidth(MUSIC_FACE_TITLE, musicTitleStr());
 #if MUSIC_TITLE_SCROLL
-  musicTitleScrolls = (musicTitleW > 240 - MUSIC_TITLE_PAD * 2);
+  musicTitleScrolls = (musicTitleW > MUSIC_META_W);
 #else
   musicTitleScrolls = false;
 #endif
   musicScrollX = 0;
   musicScrollLastMs = millis();
+  musicScrollHoldUntilMs = millis() + MUSIC_SCROLL_HOLD_MS;
 }
 
 static void musicLayoutArtist() {
   musicArtistW = musicTextWidth(MUSIC_FACE_ARTIST, npArtist);
+  musicArtistScrolls = (musicArtistW > MUSIC_META_W);
+  musicArtistScrollX = 0;
+  musicArtistScrollLastMs = millis();
+  musicArtistScrollHoldUntilMs = millis() + MUSIC_SCROLL_HOLD_MS;
 }
 
-// Blit the title into `target` at `baseline`. When scrolling, a second copy is
-// drawn one gap past the first so the marquee wraps seamlessly for ANY title
-// length (short titles slide and repeat too). writePixel clips edge glyphs.
-static void musicBlitTitle(Arduino_GFX *target, int baseline) {
-  int x = musicTitleScrolls ? (MUSIC_TITLE_PAD - musicScrollX) : (240 - musicTitleW) / 2;
-  musicDrawText(target, MUSIC_FACE_TITLE, x, baseline, musicTitleStr(), C_INK);
+// Title/artist are left-aligned in the meta column to the right of the disc.
+// `baseX` is the column's left in TARGET coords: 0 for the column canvas (whose
+// origin is already MUSIC_META_X), or MUSIC_META_X for the gfx fallback. When a
+// line is wider than the column it scrolls; a second copy one gap past the first
+// makes the marquee wrap seamlessly. writePixel clips glyphs at the column edge.
+static void musicBlitTitle(Arduino_GFX *target, int baseX, int baseline) {
+  int x = baseX + (musicTitleScrolls ? -musicScrollX : 0);
+  musicDrawText(target, MUSIC_FACE_TITLE, x, baseline, musicTitleStr(), C_MUS_INK);
   if (musicTitleScrolls)
     musicDrawText(target, MUSIC_FACE_TITLE, x + musicTitleW + MUSIC_SCROLL_GAP,
-                  baseline, musicTitleStr(), C_INK);
+                  baseline, musicTitleStr(), C_MUS_INK);
 }
 
-static void musicDrawTitleFallback(int x, int baseline) {
-  gfx->fillRect(0, MUSIC_TITLE_BAND_Y, 240, MUSIC_TITLE_BAND_H, C_CREAM);
-  musicDrawText(gfx, MUSIC_FACE_TITLE, x, baseline, musicTitleStr(), C_INK);
+static void musicBlitArtist(Arduino_GFX *target, int baseX, int baseline) {
+  int x = baseX + (musicArtistScrolls ? -musicArtistScrollX : 0);
+  musicDrawText(target, MUSIC_FACE_ARTIST, x, baseline, npArtist, C_MUS_INK_SOFT);
+  if (musicArtistScrolls)
+    musicDrawText(target, MUSIC_FACE_ARTIST, x + musicArtistW + MUSIC_SCROLL_GAP,
+                  baseline, npArtist, C_MUS_INK_SOFT);
 }
 
 static bool musicEnsureTitleCanvas() {
   if (musicTitleCanvasOk) return true;
   if (!musicTitleCanvas) {
     musicTitleCanvas = new Arduino_Canvas_Indexed(
-        240, MUSIC_TITLE_BAND_H, gfx, 0, MUSIC_TITLE_BAND_Y);
+        MUSIC_META_W, MUSIC_TITLE_BAND_H, gfx, MUSIC_META_X, MUSIC_TITLE_BAND_Y);
     if (!musicTitleCanvas) return false;
   }
   musicTitleCanvasOk = musicTitleCanvas->begin(GFX_SKIP_OUTPUT_BEGIN);
@@ -2229,12 +2315,12 @@ static bool musicEnsureTitleCanvas() {
 static void musicDrawTitle() {
   int baseline = MUSIC_FACE_TITLE.ascent;
   if (!musicEnsureTitleCanvas()) {
-    int x = musicTitleScrolls ? (MUSIC_TITLE_PAD - musicScrollX) : (240 - musicTitleW) / 2;
-    musicDrawTitleFallback(x, MUSIC_TITLE_BAND_Y + baseline);
+    gfx->fillRect(MUSIC_META_X, MUSIC_TITLE_BAND_Y, MUSIC_META_W, MUSIC_TITLE_BAND_H, C_MUS_PAPER);
+    musicBlitTitle(gfx, MUSIC_META_X, MUSIC_TITLE_BAND_Y + baseline);
     return;
   }
-  musicTitleCanvas->fillScreen(C_CREAM);
-  musicBlitTitle(musicTitleCanvas, baseline);
+  musicTitleCanvas->fillScreen(C_MUS_PAPER);
+  musicBlitTitle(musicTitleCanvas, 0, baseline);
   musicTitleCanvas->flush();
 }
 
@@ -2242,37 +2328,31 @@ static bool musicEnsureArtistCanvas() {
   if (musicArtistCanvasOk) return true;
   if (!musicArtistCanvas) {
     musicArtistCanvas = new Arduino_Canvas_Indexed(
-        240, MUSIC_ARTIST_BAND_H, gfx, 0, MUSIC_ARTIST_BAND_Y);
+        MUSIC_META_W, MUSIC_ARTIST_BAND_H, gfx, MUSIC_META_X, MUSIC_ARTIST_BAND_Y);
     if (!musicArtistCanvas) return false;
   }
   musicArtistCanvasOk = musicArtistCanvas->begin(GFX_SKIP_OUTPUT_BEGIN);
   return musicArtistCanvasOk;
 }
 
-static void musicDrawArtistFallback(int x, int baseline) {
-  gfx->fillRect(0, MUSIC_ARTIST_BAND_Y, 240, MUSIC_ARTIST_BAND_H, C_CREAM);
-  musicDrawText(gfx, MUSIC_FACE_ARTIST, x, baseline, npArtist, C_MUTE);
-}
-
 static void musicDrawArtist() {
   int baseline = MUSIC_FACE_ARTIST.ascent;
   if (!npArtist.length()) {
-    if (musicArtistCanvasOk) {
-      musicArtistCanvas->fillScreen(C_CREAM);
+    if (musicEnsureArtistCanvas()) {
+      musicArtistCanvas->fillScreen(C_MUS_PAPER);
       musicArtistCanvas->flush();
     } else {
-      gfx->fillRect(0, MUSIC_ARTIST_BAND_Y, 240, MUSIC_ARTIST_BAND_H, C_CREAM);
+      gfx->fillRect(MUSIC_META_X, MUSIC_ARTIST_BAND_Y, MUSIC_META_W, MUSIC_ARTIST_BAND_H, C_MUS_PAPER);
     }
     return;
   }
-  int x = (240 - musicArtistW) / 2;
-  if (x < MUSIC_TITLE_PAD) x = MUSIC_TITLE_PAD;
-  if (!musicArtistCanvasOk) {
-    musicDrawArtistFallback(x, MUSIC_ARTIST_BAND_Y + baseline);
+  if (!musicEnsureArtistCanvas()) {
+    gfx->fillRect(MUSIC_META_X, MUSIC_ARTIST_BAND_Y, MUSIC_META_W, MUSIC_ARTIST_BAND_H, C_MUS_PAPER);
+    musicBlitArtist(gfx, MUSIC_META_X, MUSIC_ARTIST_BAND_Y + baseline);
     return;
   }
-  musicArtistCanvas->fillScreen(C_CREAM);
-  musicDrawText(musicArtistCanvas, MUSIC_FACE_ARTIST, x, baseline, npArtist, C_MUTE);
+  musicArtistCanvas->fillScreen(C_MUS_PAPER);
+  musicBlitArtist(musicArtistCanvas, 0, baseline);
   musicArtistCanvas->flush();
 }
 
@@ -2290,40 +2370,21 @@ static bool musicShouldAnimate() {
   return !musicStopped();
 }
 
-// Draw the spinning vinyl label: erase, redraw rotated burst + orbit dot.
-// Called once on chrome-in and then each spin tick.
-static void drawRecordLabel() {
-  const uint16_t labelBg = 0x2105;  // very dark warm center
-  gfx->fillCircle(REC_CX, REC_CY, REC_LABEL_R, labelBg);
-  // Eight rotated spokes (cardinals longer, diagonals shorter)
-  float a = recordAngle;
-  for (int i = 0; i < 8; i++) {
-    float sa = a + i * (M_PI / 4.0f);
-    int r = (i % 2 == 0) ? 14 : 10;
-    int x2 = REC_CX + (int)(cosf(sa) * r);
-    int y2 = REC_CY + (int)(sinf(sa) * r);
-    gfx->drawLine(REC_CX, REC_CY, x2, y2, C_CLAUDE);
-    if (i % 2 == 0) {   // double-stroke the cardinals for weight
-      float perp = sa + (M_PI / 2.0f);
-      int px = (int)(cosf(perp)), py = (int)(sinf(perp));
-      gfx->drawLine(REC_CX + px, REC_CY + py, x2 + px, y2 + py, C_CLAUDE);
-    }
-  }
-  gfx->fillCircle(REC_CX, REC_CY, 3, C_CLAUDE);  // hub dot
-  // Single orbit dot — the asymmetric mark that makes spin legible
-  int dx = REC_CX + (int)(cosf(a) * REC_DOT_R);
-  int dy = REC_CY + (int)(sinf(a) * REC_DOT_R);
-  gfx->fillCircle(dx, dy, 2, C_CREAM);
-}
-
-// Draw static vinyl disc + grooves once on chrome switch-in.
-static void drawRecordChrome() {
-  const uint16_t grooveColor = 0x39C7;  // dark grey grooves on near-black vinyl
-  gfx->fillCircle(REC_CX, REC_CY, REC_R, C_INK);
-  gfx->drawCircle(REC_CX, REC_CY, REC_R, grooveColor);  // outer rim
-  for (int gr = REC_LABEL_R + REC_GROOVE_STEP; gr < REC_R - 2; gr += REC_GROOVE_STEP)
-    gfx->drawCircle(REC_CX, REC_CY, gr, grooveColor);
-  drawRecordLabel();
+// Vinyl-disc album art (static — drawn once with the chrome). A warm bark disc
+// with concentric grooves and an ember center label, per the Tend design's
+// "no photo, concentric warm rings" art. No EQ animation: the scrolling lyrics
+// supply the screen's motion, and the disc has none in the source design.
+static void musicDrawArt() {
+  int cx = MUSIC_ART_X + MUSIC_ART_W / 2;
+  int cy = MUSIC_ART_Y + MUSIC_ART_H / 2;
+  gfx->fillRoundRect(MUSIC_ART_X, MUSIC_ART_Y, MUSIC_ART_W, MUSIC_ART_H,
+                     MUSIC_ART_R, C_MUS_PAPER_DEEP);     // backing (rounded corners)
+  gfx->fillCircle(cx, cy, MUSIC_ART_W / 2 - 1, C_MUS_BARK);
+  for (int r = MUSIC_ART_W / 2 - 3; r > MUSIC_LABEL_R + 1; r -= 3)
+    gfx->drawCircle(cx, cy, r, C_MUS_BARK_DEEP);          // grooves
+  gfx->fillCircle(cx, cy, MUSIC_LABEL_R + 2, C_MUS_PAPER_SOFT);  // label ring
+  gfx->fillCircle(cx, cy, MUSIC_LABEL_R, C_MUS_EMBER);          // ember center label
+  gfx->fillCircle(cx, cy, 2, C_MUS_PAPER_SOFT);                 // spindle hole
 }
 
 static String musicClock(int seconds) {
@@ -2348,89 +2409,291 @@ static bool musicProgressReliable() {
   return !musicStopped() && npDur > 0 && musicDisplayPos() >= 0;
 }
 
+// Header row: an "eyebrow" label on the left (NOW PLAYING, or PAUSED to reflect
+// state) and the wall clock on the right, both in muted ink on paper — the small
+// built-in 5x7 font (the labels are ASCII). Redrawn on switch-in, on each
+// pause/identity change, and once per minute for the clock; never per second, so
+// it can't flicker. Seeds musicClockMin so the tick knows the minute it painted.
+static void musicDrawHeader() {
+  gfx->fillRect(0, 0, 240, 22, C_MUS_PAPER);
+  gfx->setTextSize(1);
+  gfx->setTextColor(C_MUS_INK_MUTED, C_MUS_PAPER);
+  gfx->setCursor(MUSIC_PAD, MUSIC_HDR_Y - 6);
+  gfx->print(musicPausedKnown() ? F("PAUSED") : F("NOW PLAYING"));
+  unsigned long e = nowEpoch();
+  String t = e ? hhmm(e + TZ_OFFSET) : String("--:--");
+  printRight(224, MUSIC_HDR_Y - 6, 1, t, C_MUS_INK_MUTED, C_MUS_PAPER);
+  musicClockMin = e ? (int)(((e + TZ_OFFSET) / 60) % 60) : -1;
+}
+
 static void musicDrawTime() {
-  gfx->fillRect(146, 222, 88, 12, C_CREAM);
+  gfx->fillRect(0, MUSIC_TIME_Y - 1, 240, 10, C_MUS_PAPER);
   if (!musicProgressReliable()) return;
   int pos = musicDisplayPos();
-  String label = musicClock(pos) + "/" + musicClock(npDur);
-  printRight(230, 224, 1, label, musicPausedKnown() ? C_MUTE : C_INK, C_CREAM);
+  uint16_t tc = C_MUS_INK_MUTED;
+  gfx->setTextSize(1);
+  gfx->setTextColor(tc, C_MUS_PAPER);
+  gfx->setCursor(MUSIC_PAD, MUSIC_TIME_Y);
+  gfx->print(musicClock(pos));
+  int rem = npDur - pos;
+  printRight(224, MUSIC_TIME_Y, 1, rem > 0 ? "-" + musicClock(rem) : "0:00", tc, C_MUS_PAPER);
 }
 
 static void musicDrawProgress() {
-  const int x = 12, y = 212, w = 216, h = 4;
-  gfx->fillRect(x - 1, y - 1, w + 2, h + 2, C_CREAM);
+  const int x = MUSIC_PAD, y = MUSIC_PROGRESS_Y, w = 240 - MUSIC_PAD * 2, h = 4;
+  gfx->fillRect(x - 4, y - 4, w + 8, h + 8, C_MUS_PAPER);
+  gfx->fillRoundRect(x, y, w, h, 2, C_MUS_PAPER_DEEP);   // sunken track
   if (!musicProgressReliable()) return;
   int pos = musicDisplayPos();
-  gfx->fillRoundRect(x, y, w, h, 2, C_TAN);
-  int fillW = (int)((long)pos * w / npDur);
-  fillW = constrain(fillW, 0, w);
-  if (fillW > 0) gfx->fillRoundRect(x, y, fillW, h, 2, musicPausedKnown() ? C_MUTE : C_CLAUDE);
+  uint16_t fc = musicPausedKnown() ? C_MUS_INK_FAINT : C_MUS_EMBER;
+  int fillW = constrain((int)((long)pos * w / npDur), 0, w);
+  if (fillW > 0) gfx->fillRoundRect(x, y, fillW, h, 2, fc);
 }
 
+// Progress + time region only (between the art and the lyric band). The lyric
+// band has its own change-gated repaint and is NOT cleared here.
 static void musicDrawFooter() {
-  gfx->fillRect(0, 207, 240, 33, C_CREAM);
+  gfx->fillRect(0, MUSIC_PROGRESS_Y - 6, 240,
+                (MUSIC_TIME_Y + 10) - (MUSIC_PROGRESS_Y - 6), C_MUS_PAPER);
   musicDrawTime();
   musicDrawProgress();
 }
 
+static bool musicCompactLyricText(const String &s, String &out) {
+  out = "";
+  unsigned int i = 0;
+  while (i < s.length()) {
+    uint32_t cp = utf8Next(s, i);
+    if (cp >= 0x0E00 && cp <= 0x0E7F) return false;  // keep Thai on the real font
+    if (cp >= 0x20 && cp <= 0x7E) out += (char)cp;
+    else if (cp == 0x2018 || cp == 0x2019) out += '\'';
+    else if (cp == 0x201C || cp == 0x201D) out += '"';
+    else if (cp == 0x2013 || cp == 0x2014) out += '-';
+    else if (cp == 0x2026) out += "...";
+    else out += '?';
+  }
+  return out.length() > 0;
+}
+
+static bool musicShouldCompactLyric(const String &s, String &compact) {
+  const int maxChars = (240 - MUSIC_PAD * 2) / 6;
+  return musicCompactLyricText(s, compact) &&
+         (musicTextWidth(MUSIC_FACE_ARTIST, s) > (240 - MUSIC_PAD * 2) ||
+          (int)compact.length() > maxChars);
+}
+
+static bool musicLyricUsesCompact(const String &s) {
+  String compact;
+  return musicShouldCompactLyric(s, compact);
+}
+
+static void musicDrawCompactAsciiLyric(int y, const String &s, uint16_t fg) {
+  const int maxChars = (240 - MUSIC_PAD * 2) / 6;  // default GFX font, textSize 1
+  gfx->setTextSize(1);
+  gfx->setTextColor(fg, C_MUS_PAPER);
+
+  String rest = s;
+  for (int row = 0; row < 3 && rest.length(); row++) {
+    String line = rest;
+    if ((int)rest.length() > maxChars) {
+      int remainingRows = 2 - row;
+      int minBreak = (int)rest.length() - remainingRows * maxChars;
+      if (minBreak < 1) minBreak = 1;
+      int breakAt = -1;
+      int searchFrom = maxChars;
+      if (searchFrom >= (int)rest.length()) searchFrom = (int)rest.length() - 1;
+      for (int i = searchFrom; i >= minBreak; i--) {
+        if (rest[i] == ' ') { breakAt = i; break; }
+      }
+      if (breakAt < 1 || breakAt > maxChars) breakAt = maxChars;
+      line = rest.substring(0, breakAt);
+      int start = breakAt;
+      while (start < (int)rest.length() && rest[start] == ' ') start++;
+      rest = rest.substring(start);
+    } else {
+      rest = "";
+    }
+    if ((int)line.length() > maxChars) line = line.substring(0, maxChars);
+    gfx->setCursor(MUSIC_PAD, y + row * 10);
+    gfx->print(line);
+  }
+}
+
+static void musicDrawLyricLine(const String &s, int baseline, uint16_t fg,
+                               int scrollX, int textW, bool scrolls) {
+  String compact;
+  if (musicShouldCompactLyric(s, compact)) {
+    musicDrawCompactAsciiLyric(baseline - 27, compact, fg);
+    return;
+  }
+  int x = MUSIC_PAD + (scrolls ? -scrollX : 0);
+  musicDrawText(gfx, MUSIC_FACE_ARTIST, x, baseline, s, fg);
+  if (scrolls)
+    musicDrawText(gfx, MUSIC_FACE_ARTIST, x + textW + MUSIC_SCROLL_GAP,
+                  baseline, s, fg);
+}
+
+static void musicLayoutLyrics(const String &l1, const String &l2) {
+  musicLyricW1 = musicLyricUsesCompact(l1) ? 0 : musicTextWidth(MUSIC_FACE_ARTIST, l1);
+  musicLyricW2 = musicLyricUsesCompact(l2) ? 0 : musicTextWidth(MUSIC_FACE_ARTIST, l2);
+  musicLyricScrolls1 = l1.length() && musicLyricW1 > (240 - MUSIC_PAD * 2);
+  musicLyricScrolls2 = l2.length() && musicLyricW2 > (240 - MUSIC_PAD * 2);
+  musicLyricScrollX1 = 0;
+  musicLyricScrollX2 = 0;
+  musicLyricScrollLastMs = millis();
+  musicLyricScrollHoldUntilMs = millis() + MUSIC_SCROLL_HOLD_MS;
+}
+
+static void musicPaintLyrics() {
+  gfx->fillRect(0, MUSIC_LYRIC_Y, 240, MUSIC_LYRIC_H, C_MUS_PAPER);
+  if (musicLyricShown1.length())
+    musicDrawLyricLine(musicLyricShown1, MUSIC_LYRIC1_BASE, C_MUS_INK,
+                       musicLyricScrollX1, musicLyricW1, musicLyricScrolls1);
+  if (musicLyricShown2.length())
+    musicDrawLyricLine(musicLyricShown2, MUSIC_LYRIC2_BASE, C_MUS_INK_MUTED,
+                       musicLyricScrollX2, musicLyricW2, musicLyricScrolls2);
+}
+
+// Two-line lyric band at the bottom (the user's deviation from the source design,
+// which has transport controls here): the current line in ink, the upcoming line
+// dim below it. Long English/Latin lines use the compact built-in font and wrap
+// inside their lyric slot; Thai lines keep the bundled bitmap font so combining
+// marks remain correct. Repaints in place only when a line actually changes
+// (push / auto-promote), never on the 1 s tick, so the band never flickers.
+// This keeps the same opaque-repaint discipline as the title/artist bands.
+static void musicDrawLyrics() {
+  String l1 = npLyric, l2 = npLyric2;
+  if (musicStopped()) { l1 = ""; l2 = ""; }
+  if (l1 == musicLyricShown1 && l2 == musicLyricShown2) return;
+  musicLyricShown1 = l1;
+  musicLyricShown2 = l2;
+  musicLayoutLyrics(l1, l2);
+  musicPaintLyrics();
+}
+
 static void drawMusicChrome() {
-  gfx->fillScreen(C_CREAM);
-  recordAngle = 0.0f;
-  recordLastMs = millis();
+  gfx->fillScreen(C_MUS_PAPER);
+  musicDrawHeader();
+  musicDrawArt();
+  musicLyricShown1 = "\x01";        // force the lyric band to repaint after the clear
+  musicLyricShown2 = "\x01";
   musicTimeLastMs = 0;
-  drawRecordChrome();
   musicDrawFooter();
 }
 
 void drawMusic() {
   if (!musicChromeReady) { drawMusicChrome(); musicChromeReady = true; }
+  else musicDrawHeader();   // refresh eyebrow (play/pause) + clock on pause/identity change
   musicLayoutTitle();
   musicLayoutArtist();
   musicDrawTitle();
   musicDrawArtist();
   musicDrawFooter();
+  musicDrawLyrics();
 }
 
-// Per-loop tick: advance the vinyl spin and the title marquee.
+// Per-loop tick: refresh the clock/progress, promote synced lyric lines on time,
+// and advance the title/artist marquees. No timer ISR — all millis()-polled.
 static void musicTick() {
   unsigned long now = millis();
-  // Spin only when playing (not stopped, not paused); reset timestamp when idle
-  // so resume never causes a large angle jump.
-  bool spinning = !musicStopped() && npPaused != 1;
-  if (spinning && now - recordLastMs >= REC_FRAME_MS) {
-    float dt = (now - recordLastMs) / 1000.0f;
-    recordAngle += dt * (REC_RPM / 60.0f) * (2.0f * M_PI);
-    if (recordAngle >= 2.0f * M_PI) recordAngle -= 2.0f * M_PI;
-    recordLastMs = now;
-    drawRecordLabel();
-  } else if (!spinning) {
-    recordLastMs = now;
-  }
-  if (npDur > 0 && now - musicTimeLastMs >= 1000UL) {
+
+  // Progress bar / time counter (once per second)
+  if (now - musicTimeLastMs >= 1000UL) {
     musicTimeLastMs = now;
     musicDrawTime();
     musicDrawProgress();
+    // Header clock: repaint only when the displayed minute rolls over.
+    unsigned long e = nowEpoch();
+    if (e) {
+      int mn = (int)(((e + TZ_OFFSET) / 60) % 60);
+      if (mn != musicClockMin) musicDrawHeader();
+    }
+    // Synced-lyric auto-promote: when the interpolated position reaches the
+    // upcoming line's timestamp, slide it up to current (the daemon refills the
+    // next line on its following push). This keeps the swap on-beat between the
+    // daemon's coarser pushes, using the same interpolated clock as the progress.
+    if (npLyricAt >= 0 && npPaused == 0 && musicDisplayPos() >= npLyricAt) {
+      npLyric = npLyric2;
+      npLyric2 = "";
+      npLyricAt = -1;
+      musicDrawLyrics();
+    }
   }
-  if (!musicTitleScrolls || !musicShouldAnimate()) return;
-  int scrollMax = musicTitleW - (240 - MUSIC_TITLE_PAD * 2);
-  if (scrollMax <= 0) return;
-  if (now < musicScrollHoldUntilMs) return;
-  if (musicScrollX >= scrollMax) {
-    musicScrollX = 0;
-    musicScrollLastMs = now;
-    musicScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
-    musicDrawTitle();
-    return;
+
+  // Title marquee — seamless infinite loop: scroll by (titleW + gap) then reset to 0
+  // so the wrap-around second copy lands exactly where the first started.
+  if (musicTitleScrolls && musicShouldAnimate() && now >= musicScrollHoldUntilMs) {
+    int scrollMax = musicTitleW + MUSIC_SCROLL_GAP;
+    if (musicScrollX >= scrollMax) {
+      musicScrollX = 0;
+      musicScrollLastMs = now;
+      musicScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+      musicDrawTitle();
+    } else {
+      long span = (long)(now - musicScrollLastMs) * MUSIC_SCROLL_PXPS / 1000L;
+      if (span >= MUSIC_SCROLL_STEP_PX) {
+        musicScrollLastMs = now;
+        musicScrollX += (int)span;
+        if (musicScrollX >= scrollMax) {
+          musicScrollX = scrollMax;
+          musicScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+        }
+        musicDrawTitle();
+      }
+    }
   }
-  long span = (long)(now - musicScrollLastMs) * MUSIC_SCROLL_PXPS / 1000L;
-  if (span < MUSIC_SCROLL_STEP_PX) return;            // let the delta accumulate
-  musicScrollLastMs = now;
-  musicScrollX += (int)span;
-  if (musicScrollX >= scrollMax) {
-    musicScrollX = scrollMax;
-    musicScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+
+  // Artist marquee — same seamless-loop pattern as the title
+  if (musicArtistScrolls && musicShouldAnimate() && now >= musicArtistScrollHoldUntilMs) {
+    int artistScrollMax = musicArtistW + MUSIC_SCROLL_GAP;
+    if (musicArtistScrollX >= artistScrollMax) {
+      musicArtistScrollX = 0;
+      musicArtistScrollLastMs = now;
+      musicArtistScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+      musicDrawArtist();
+    } else {
+      long span = (long)(now - musicArtistScrollLastMs) * MUSIC_SCROLL_PXPS / 1000L;
+      if (span >= MUSIC_SCROLL_STEP_PX) {
+        musicArtistScrollLastMs = now;
+        musicArtistScrollX += (int)span;
+        if (musicArtistScrollX >= artistScrollMax) {
+          musicArtistScrollX = artistScrollMax;
+          musicArtistScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+        }
+        musicDrawArtist();
+      }
+    }
   }
-  musicDrawTitle();
+
+  // Lyric marquee for Thai/non-compact overflow. English long lines already wrap
+  // in compact text, so only custom-font lyric lines reach this branch.
+  if ((musicLyricScrolls1 || musicLyricScrolls2) &&
+      musicShouldAnimate() && now >= musicLyricScrollHoldUntilMs) {
+    long span = (long)(now - musicLyricScrollLastMs) * MUSIC_SCROLL_PXPS / 1000L;
+    if (span >= MUSIC_SCROLL_STEP_PX) {
+      bool changed = false;
+      musicLyricScrollLastMs = now;
+      if (musicLyricScrolls1) {
+        int scrollMax = musicLyricW1 + MUSIC_SCROLL_GAP;
+        musicLyricScrollX1 += (int)span;
+        if (musicLyricScrollX1 >= scrollMax) {
+          musicLyricScrollX1 = 0;
+          musicLyricScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+        }
+        changed = true;
+      }
+      if (musicLyricScrolls2) {
+        int scrollMax = musicLyricW2 + MUSIC_SCROLL_GAP;
+        musicLyricScrollX2 += (int)span;
+        if (musicLyricScrollX2 >= scrollMax) {
+          musicLyricScrollX2 = 0;
+          musicLyricScrollHoldUntilMs = now + MUSIC_SCROLL_HOLD_MS;
+        }
+        changed = true;
+      }
+      if (changed) musicPaintLyrics();
+    }
+  }
 }
 
 void drawMeter() {

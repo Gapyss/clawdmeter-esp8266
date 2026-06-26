@@ -27,8 +27,13 @@ from pathlib import Path
 # ---- Edit if needed ----
 DEVICE_URL = os.environ.get("CLAWDMETER_DEVICE_URL", "http://clawdmeter.local")
 POLL_INTERVAL = 60                       # seconds between Claude usage polls
-NOWPLAYING_TICK = 8                      # seconds between YouTube Music tab reads
-NOWPLAYING_RESYNC = 30                   # coarse position resync; avoid pushes every tick
+NOWPLAYING_TICK = 4                      # seconds between YouTube Music tab reads
+# Lower = snappier track-skip / pause detection (the most visible "seam"). The read is
+# a ~300ms Mac-side osascript+Chrome scriptlet, gated so it adds no extra DEVICE pushes
+# (yt-dlp/lrclib only hit the network on identity change); 4s halves skip/pause lag vs 8s
+# at ~7.5% read duty. The expensive ESP8266 thermal/WiFi constraints are device-side and
+# unaffected by this. Don't go below the osascript round-trip time (~0.3s).
+NOWPLAYING_RESYNC = 10                   # coarse position resync; avoid pushes every tick
 RAW_USAGE_SOURCE = os.environ.get("CLAWDMETER_USAGE_SOURCE", "api").lower()
 USAGE_SOURCE = {"server": "api", "headers": "api"}.get(RAW_USAGE_SOURCE, RAW_USAGE_SOURCE)
 RATE_LIMIT_BACKOFF = 10 * 60             # seconds when API does not send Retry-After
@@ -247,6 +252,20 @@ def mac_metrics():
 NOWPLAYING_SUFFIXES = (" - YouTube Music", " | YouTube Music")
 YTDLP_CACHE = {}
 YTDLP_WARNED = False
+LRCLIB_CACHE = {}
+LRCLIB_FAIL = {}          # key -> monotonic time of last network failure (negative cache)
+LRCLIB_WARNED = False
+LRCLIB_TIMEOUT = float(os.environ.get("CLAWDMETER_LRCLIB_TIMEOUT", "5"))
+# After a network failure, don't hammer lrclib every tick: back off per-song so a
+# sustained outage costs one (timeout-bounded) attempt every few minutes, not one
+# every NOWPLAYING_TICK seconds.
+LRCLIB_RETRY_BACKOFF = float(os.environ.get("CLAWDMETER_LRCLIB_RETRY_BACKOFF", "300"))
+LYRIC_ADVANCE_SECONDS = float(os.environ.get("CLAWDMETER_LYRIC_ADVANCE_SECONDS", "4.5"))
+MAX_LYRIC_CHARS = int(os.environ.get("CLAWDMETER_MAX_LYRIC_CHARS", "64"))
+LRCLIB_USER_AGENT = os.environ.get(
+    "CLAWDMETER_LRCLIB_USER_AGENT",
+    "Clawdmeter/1.0 (https://github.com/HermannBjorgvin/Clawdmeter)",
+)
 NOWPLAYING_SCRIPT = (
     'tell application "System Events"\n'
     '  if not ((name of processes) contains "Google Chrome") then return ""\n'
@@ -327,6 +346,7 @@ def ytdlp_metadata(url, title="", artist=""):
         "skip_download": True,
         "extract_flat": False,
         "noplaylist": True,
+        "socket_timeout": 10,  # don't let a slow YouTube response stall the now-playing tick
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -374,13 +394,219 @@ def read_now_playing():
     return (title, artist, pos, dur, paused)
 
 
-def push_now_playing(title, artist, pos=-1, dur=-1, paused=-1):
+def lyric_key(title, artist, dur):
+    if not title:
+        return None
+    dur_key = int(dur) if dur and dur > 0 else 0
+    return (
+        re.sub(r"\s+", " ", title).strip().lower(),
+        re.sub(r"\s+", " ", artist or "").strip().lower(),
+        dur_key,
+    )
+
+
+def clean_lyric_line(line):
+    return re.sub(r"\s+", " ", (line or "").strip())
+
+
+def parse_lrc(text):
+    """Parse LRC synced lyrics into [(seconds, line), ...]."""
+    lines = []
+    for raw in (text or "").splitlines():
+        stamps = re.findall(r"\[(\d+):(\d+(?:\.\d+)?)\]", raw)
+        if not stamps:
+            continue
+        lyric = clean_lyric_line(re.sub(r"(?:\[\d+:\d+(?:\.\d+)?\])+", "", raw))
+        if not lyric:
+            continue
+        for minutes, seconds in stamps:
+            try:
+                lines.append((int(minutes) * 60 + float(seconds), lyric))
+            except ValueError:
+                pass
+    lines.sort(key=lambda item: item[0])
+    return lines
+
+
+def parse_plain_lyrics(text):
+    return [clean_lyric_line(line) for line in (text or "").splitlines()
+            if clean_lyric_line(line)]
+
+
+def empty_lyrics():
+    return {"synced": [], "plain": [], "instrumental": False}
+
+
+def lyrics_from_lrclib_payload(payload):
+    if not isinstance(payload, dict):
+        return empty_lyrics()
+    if payload.get("instrumental"):
+        return {"synced": [], "plain": [], "instrumental": True}
+    synced = parse_lrc(payload.get("syncedLyrics") or "")
+    plain = parse_plain_lyrics(payload.get("plainLyrics") or "")
+    return {"synced": synced, "plain": plain, "instrumental": False}
+
+
+def lrclib_json(endpoint, params):
+    query = urllib.parse.urlencode(
+        {k: v for k, v in params.items() if v not in ("", None, -1)}
+    )
+    req = urllib.request.Request(
+        f"https://lrclib.net{endpoint}?{query}",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": LRCLIB_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=LRCLIB_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def lrclib_score(candidate, title, artist, dur):
+    score = 0
+    cand_title = (candidate.get("trackName") or "").strip().lower()
+    cand_artist = (candidate.get("artistName") or "").strip().lower()
+    want_title = (title or "").strip().lower()
+    want_artist = (artist or "").strip().lower()
+    if cand_title == want_title:
+        score += 50
+    elif want_title and want_title in cand_title:
+        score += 20
+    if want_artist and cand_artist == want_artist:
+        score += 30
+    elif want_artist and want_artist in cand_artist:
+        score += 10
+    cand_dur = int(candidate.get("duration") or 0)
+    if dur and dur > 0 and cand_dur > 0:
+        delta = abs(cand_dur - int(dur))
+        if delta <= 2:
+            score += 20
+        elif delta <= 8:
+            score += 8
+        else:
+            score -= min(delta, 30)
+    if candidate.get("syncedLyrics"):
+        score += 5
+    if candidate.get("plainLyrics"):
+        score += 2
+    return score
+
+
+def fetch_lyrics(title, artist, dur):
+    """Return cached parsed lyrics for the current song, fetching from lrclib if needed."""
+    global LRCLIB_WARNED
+    key = lyric_key(title, artist, dur)
+    if key is None:
+        return empty_lyrics()
+    if key in LRCLIB_CACHE:
+        return LRCLIB_CACHE[key]
+    fail_at = LRCLIB_FAIL.get(key)
+    if fail_at is not None and time.monotonic() - fail_at < LRCLIB_RETRY_BACKOFF:
+        return empty_lyrics()
+
+    params = {"track_name": title, "artist_name": artist}
+    if dur and dur > 0:
+        params["duration"] = int(dur)
+
+    payload = None
+    try:
+        payload = lrclib_json("/api/get", params)
+        if payload is None:
+            results = lrclib_json("/api/search", {
+                "track_name": title,
+                "artist_name": artist,
+            })
+            if results:
+                payload = max(results, key=lambda item: lrclib_score(item, title, artist, dur))
+    except (TimeoutError, socket.timeout, urllib.error.URLError, json.JSONDecodeError) as e:
+        LRCLIB_FAIL[key] = time.monotonic()
+        if not LRCLIB_WARNED:
+            print(f"lrclib lookup failed; backing off {int(LRCLIB_RETRY_BACKOFF)}s: {e}",
+                  file=sys.stderr)
+            LRCLIB_WARNED = True
+        return empty_lyrics()
+
+    LRCLIB_FAIL.pop(key, None)
+    parsed = lyrics_from_lrclib_payload(payload)
+    LRCLIB_CACHE[key] = parsed
+    return parsed
+
+
+def synced_lyric_payload(lines, pos):
+    idx = -1
+    for i, (line_pos, _line) in enumerate(lines):
+        if line_pos <= pos:
+            idx = i
+        else:
+            break
+    current = lines[idx][1] if idx >= 0 else ""
+    next_idx = idx + 1
+    next_line = lines[next_idx][1] if next_idx < len(lines) else ""
+    # Firmware stores lt as integer seconds. Round up so a fractional LRC stamp
+    # never promotes the next line early.
+    next_at = int(lines[next_idx][0] + 0.999) if next_idx < len(lines) else -1
+    return current, next_line, next_at, idx
+
+
+def lyric_payload(title, artist, pos, dur, paused, now, state):
+    """Return (lyric, lyric2, lt) for the current tick."""
+    key = lyric_key(title, artist, dur)
+    if key != state.get("key"):
+        state.clear()
+        state.update({"key": key, "plain_index": 0, "plain_last": now, "synced_index": None})
+
+    if key is None:
+        return "", "", -1
+
+    parsed = fetch_lyrics(title, artist, dur)
+    synced = parsed.get("synced") or []
+    if synced and pos >= 0:
+        lyric, lyric2, next_at, idx = synced_lyric_payload(synced, pos)
+        state["synced_index"] = idx
+        return lyric, lyric2, next_at
+
+    plain = parsed.get("plain") or []
+    if not plain:
+        return "", "", -1
+
+    # Plain (unsynced) lyrics have no timestamps, so we advance them on a wall-clock
+    # cadence — but only while playing. While paused, hold the line and keep the timer
+    # base at `now` so resume doesn't jump (and lyric_changed stays False, so a paused
+    # track stops emitting a fresh push every tick). Cadence is wall-clock
+    # (LYRIC_ADVANCE_SECONDS via `now - plain_last`), not per-tick, so it's independent of
+    # NOWPLAYING_TICK — a faster tick just tracks the intended cadence more closely. This
+    # only matters for lyrics that have nothing real to sync against.
+    if paused == 1:
+        state["plain_last"] = now
+    else:
+        elapsed = now - state.get("plain_last", now)
+        if elapsed >= LYRIC_ADVANCE_SECONDS:
+            steps = int(elapsed / LYRIC_ADVANCE_SECONDS)
+            state["plain_index"] = min(len(plain) - 1, state.get("plain_index", 0) + steps)
+            state["plain_last"] = now
+    idx = state.get("plain_index", 0)
+    return plain[idx], plain[idx + 1] if idx + 1 < len(plain) else "", -1
+
+
+def push_now_playing(title, artist, pos=-1, dur=-1, paused=-1, lyric="", lyric2="", lt=-1):
     """Best-effort push of the current song. UTF-8 is preserved (Thai stays Thai)."""
-    # Pad title so short titles have breathing room at the edges when centered.
-    padded = f" {title} " if title else title
-    url = (f"{DEVICE_URL}/nowplaying?title={urllib.parse.quote(padded)}"
-           f"&artist={urllib.parse.quote(artist)}"
+    quote = urllib.parse.quote
+    # Defensive cap: the device clips lyric lines at the panel edge (no marquee), so a
+    # pathologically long line gains nothing on-screen and only bloats the request URL.
+    # Title/artist are intentionally NOT capped — they marquee-scroll on the device.
+    lyric = lyric[:MAX_LYRIC_CHARS]
+    lyric2 = lyric2[:MAX_LYRIC_CHARS]
+    url = (f"{DEVICE_URL}/nowplaying?title={quote(title, safe='')}"
+           f"&artist={quote(artist, safe='')}"
            f"&pos={int(pos)}&dur={int(dur)}&paused={int(paused)}")
+    url += (f"&lyric={quote(lyric, safe='')}"
+            f"&lyric2={quote(lyric2, safe='')}"
+            f"&lt={int(lt)}")
     try:
         device_post(url)
         shown = title or "— Not Playing —"
@@ -608,10 +834,12 @@ def main():
     # keeping the (costlier) Claude usage poll on its 60s cadence via a deadline.
     next_usage = 0.0          # monotonic time of the next due usage poll (0 = now)
     # Seed with the "nothing playing" state so a daemon (re)start with no song
-    # open sends no /nowplaying push — otherwise it would yank the device to a
-    # blank "Not Playing" music card on every launchd restart. The first real
+    # open sends no /nowplaying push (now-playing is web-only, but there's still
+    # no reason to push an empty card on every launchd restart). The first real
     # song still differs from this and pushes.
     last_song = ("", "", -1, -1, -1)
+    lyric_state = {}
+    last_lyric_payload = ("", "", -1)
     last_nowplaying_push = 0.0
     while True:
         now = time.monotonic()
@@ -620,6 +848,7 @@ def main():
 
         song = read_now_playing()
         title, artist, pos, dur, paused = song
+        lyrics = lyric_payload(title, artist, pos, dur, paused, now, lyric_state)
         last_title, last_artist, _last_pos, last_dur, last_paused = last_song
         state_changed = (
             title != last_title or
@@ -627,14 +856,16 @@ def main():
             dur != last_dur or
             paused != last_paused
         )
+        lyric_changed = lyrics != last_lyric_payload
         resync_due = (
             bool(title) and pos >= 0 and dur > 0 and
             now - last_nowplaying_push >= NOWPLAYING_RESYNC
         )
         last_song = song
-        if state_changed or resync_due:
-            push_now_playing(*song)
+        if state_changed or lyric_changed or resync_due:
+            push_now_playing(*song, lyric=lyrics[0], lyric2=lyrics[1], lt=lyrics[2])
             last_nowplaying_push = now
+            last_lyric_payload = lyrics
 
         time.sleep(NOWPLAYING_TICK)
 
