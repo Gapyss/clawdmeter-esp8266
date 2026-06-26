@@ -183,8 +183,9 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
   body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--text);margin:0;min-height:100vh}
   main{width:min(980px,100%);margin:0 auto;padding:22px;display:grid;gap:16px}
   header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);padding-bottom:14px}
-  h1{font-size:24px;line-height:1.1;margin:0;font-weight:700;letter-spacing:0}
-  .sub,.muted{color:var(--muted);font-size:13px}
+  h1{font-size:20px;line-height:1.15;margin:0;font-weight:700;letter-spacing:0}
+  .sub{color:var(--muted);font-size:12px;line-height:1.35;margin-top:3px}
+  .muted{color:var(--muted);font-size:13px}
   .status{display:flex;align-items:center;gap:8px;justify-content:flex-end;flex-wrap:wrap;text-align:right}
   .dot{width:10px;height:10px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 3px rgba(139,148,158,.15)}
   .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
@@ -699,7 +700,13 @@ void handleNowPlaying() {
   }
   if (server.hasArg("dur")) npDur = server.arg("dur").toInt();
   if (server.hasArg("paused")) npPaused = constrain(server.arg("paused").toInt(), -1, 1);
-  bool identityChanged = oldTitle != npTitle || oldArtist != npArtist || oldDur != npDur;
+  bool trackChanged = oldTitle != npTitle || oldArtist != npArtist;
+  bool durationChanged = oldDur != npDur;
+  bool identityChanged = trackChanged || durationChanged;
+  if (trackChanged) {
+    npPos = 0;
+    npPosBaseMs = millis();
+  }
   if (server.hasArg("lyric")) {
     npLyric = server.arg("lyric");
     npLyric2 = server.hasArg("lyric2") ? server.arg("lyric2") : String("");
@@ -710,10 +717,6 @@ void handleNowPlaying() {
     npLyricAt = -1;
   }
   if (lcdScreen == SCREEN_MUSIC) {
-    if (identityChanged) {
-      npPos = 0;
-      npPosBaseMs = millis();
-    }
     bool pausedChanged = oldPaused != npPaused;
     if (identityChanged || pausedChanged) drawMusic();
     else {

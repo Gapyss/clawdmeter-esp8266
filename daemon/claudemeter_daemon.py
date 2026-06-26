@@ -248,7 +248,16 @@ def mac_metrics():
 # We read the *tab title* and URL of any open YouTube Music tab. The guard at the
 # top returns "" before the "Google Chrome" tell block runs when Chrome is not
 # already running, so a background daemon never launches the browser. Current
-# position requires Chrome's View > Developer > Allow JavaScript from Apple Events.
+# position/duration require Chrome's View > Developer > Allow JavaScript from Apple
+# Events.
+#
+# Position/duration are read from YT Music's own player UI (`#progress-bar`'s
+# aria-valuenow/aria-valuemax), NOT from the `<video>` element. During autoplay /
+# radio-mix advance YT Music streams the whole queue through one continuous MSE
+# `<video>`, so `video.currentTime`/`video.duration` are the *cumulative* timeline
+# of every track played so far (they keep growing and never reset on song change) —
+# the 2nd autoplay song would report a multi-hundred-second "duration". The
+# progress bar resets per song and its aria-valuemax is the real track length.
 NOWPLAYING_SUFFIXES = (" - YouTube Music", " | YouTube Music")
 YTDLP_CACHE = {}
 YTDLP_WARNED = False
@@ -278,7 +287,7 @@ NOWPLAYING_SCRIPT = (
     '      if u contains "music.youtube.com" or ti ends with "- YouTube Music" or ti ends with "| YouTube Music" then\n'
     '        set meta to "-1|-1|-1"\n'
     '        try\n'
-    '          set meta to execute t javascript "(function(){var v=document.querySelector(\'video\'); if(!v) return \'-1|-1|-1\'; return Math.floor(v.currentTime||-1)+\'|\' + Math.floor(v.duration||-1)+\'|\' + (v.paused?1:0);})()"\n'
+    '          set meta to execute t javascript "(function(){var v=document.querySelector(\'video\');var p=v?(v.paused?1:0):-1;var b=document.querySelector(\'#progress-bar\');var n=b?parseFloat(b.getAttribute(\'aria-valuenow\')):NaN;var m=b?parseFloat(b.getAttribute(\'aria-valuemax\')):NaN;var pos=isFinite(n)?Math.floor(n):-1;var dur=(isFinite(m)&&m>0)?Math.floor(m):-1;return pos+\'|\'+dur+\'|\'+p;})()"\n'
     '        end try\n'
     '        return ti & linefeed & u & linefeed & meta\n'
     '      end if\n'
@@ -390,7 +399,31 @@ def read_now_playing():
         title = meta["title"]
     if meta.get("artist") and not artist and not meta.get("search"):
         artist = meta["artist"]
-    dur = meta.get("duration") or browser_dur
+    # YT Music's player progress bar (read in NOWPLAYING_SCRIPT) is authoritative for
+    # the currently loaded track's duration. yt-dlp is only a fallback: URL/search
+    # metadata can lag or resolve the wrong version during YouTube Music auto-advance.
+    # (The raw <video> element is deliberately NOT used for duration — see the
+    # NOWPLAYING_SCRIPT note: it reports the cumulative autoplay-queue timeline.)
+    dur = browser_dur if browser_dur > 0 else (meta.get("duration") or -1)
+    return (title, artist, pos, dur, paused)
+
+
+def normalize_nowplaying_timing(song, last_song):
+    """Drop transient Chrome timing that cannot belong to the reported song."""
+    title, artist, pos, dur, paused = song
+    last_title, last_artist, _last_pos, _last_dur, _last_paused = last_song
+    track_changed = bool(last_title or last_artist) and (
+        title != last_title or artist != last_artist
+    )
+
+    if not title or pos < 0 or dur <= 0:
+        return song
+    if track_changed:
+        if pos >= max(dur - 2, 0):
+            dur = -1
+        pos = 0
+    elif pos > dur:
+        pos = dur
     return (title, artist, pos, dur, paused)
 
 
@@ -534,6 +567,15 @@ def fetch_lyrics(title, artist, dur):
     LRCLIB_FAIL.pop(key, None)
     parsed = lyrics_from_lrclib_payload(payload)
     LRCLIB_CACHE[key] = parsed
+    if parsed["instrumental"]:
+        kind = "instrumental"
+    elif parsed["synced"]:
+        kind = f"synced ({len(parsed['synced'])} lines)"
+    elif parsed["plain"]:
+        kind = f"plain ({len(parsed['plain'])} lines)"
+    else:
+        kind = "none found"
+    print(f"lyrics: {kind} for {title}" + (f" — {artist}" if artist else ""))
     return parsed
 
 
@@ -846,10 +888,10 @@ def main():
         if now >= next_usage:
             next_usage = now + poll_and_push_usage()
 
-        song = read_now_playing()
+        last_title, last_artist, _last_pos, last_dur, last_paused = last_song
+        song = normalize_nowplaying_timing(read_now_playing(), last_song)
         title, artist, pos, dur, paused = song
         lyrics = lyric_payload(title, artist, pos, dur, paused, now, lyric_state)
-        last_title, last_artist, _last_pos, last_dur, last_paused = last_song
         state_changed = (
             title != last_title or
             artist != last_artist or
