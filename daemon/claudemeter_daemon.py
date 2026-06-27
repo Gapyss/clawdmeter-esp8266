@@ -9,6 +9,7 @@ Claude Code's local JSONL transcripts instead.
 
 Runs on system Python 3. YouTube Music duration metadata uses optional yt-dlp.
 """
+import difflib
 import json
 import os
 import re
@@ -35,6 +36,11 @@ NOWPLAYING_TICK = 4                      # seconds between YouTube Music tab rea
 # at ~7.5% read duty. The expensive ESP8266 thermal/WiFi constraints are device-side and
 # unaffected by this. Don't go below the osascript round-trip time (~0.3s).
 NOWPLAYING_RESYNC = 10                   # coarse position resync; avoid pushes every tick
+NOWPLAYING_IDLE_TICK = int(os.environ.get("CLAWDMETER_NOWPLAYING_IDLE_TICK", "20"))
+# When no song tab is open the 4s read just spawns osascript to get back "". Slow the
+# tick while idle to cut those wasted spawns; snap back to NOWPLAYING_TICK the moment a
+# song is playing (skip/pause detection stays at 4s — see NOWPLAYING_TICK). Cost: first
+# detection after an idle stretch can lag up to this interval, which is fine when idle.
 RAW_USAGE_SOURCE = os.environ.get("CLAWDMETER_USAGE_SOURCE", "api").lower()
 USAGE_SOURCE = {"server": "api", "headers": "api"}.get(RAW_USAGE_SOURCE, RAW_USAGE_SOURCE)
 RATE_LIMIT_BACKOFF = 10 * 60             # seconds when API does not send Retry-After
@@ -245,8 +251,10 @@ def mac_metrics():
     }
 
 
-# ---- YouTube Music now-playing (read from a Chrome tab title) ----
-# We read the *tab title* and URL of any open YouTube Music tab. The guard at the
+# ---- YouTube Music now-playing (read from a Chrome tab) ----
+# We read the tab title, URL, and (via page JS) the live MediaSession metadata of
+# any open YouTube Music tab; MediaSession title/artist is preferred over the tab
+# title, which often stays "YouTube Music" for home-feed playback. The guard at the
 # top returns "" before the "Google Chrome" tell block runs when Chrome is not
 # already running, so a background daemon never launches the browser. Current
 # position/duration require Chrome's View > Developer > Allow JavaScript from Apple
@@ -310,7 +318,7 @@ NOWPLAYING_SCRIPT = (
     '      if u contains "music.youtube.com" or ti ends with "- YouTube Music" or ti ends with "| YouTube Music" then\n'
     '        set meta to "-1|-1|-1"\n'
     '        try\n'
-    '          set meta to execute t javascript "(function(){var v=document.querySelector(\'video\');var p=v?(v.paused?1:0):-1;var b=document.querySelector(\'#progress-bar\');var n=b?parseFloat(b.getAttribute(\'aria-valuenow\')):NaN;var m=b?parseFloat(b.getAttribute(\'aria-valuemax\')):NaN;var pos=isFinite(n)?Math.floor(n):-1;var dur=(isFinite(m)&&m>0)?Math.floor(m):-1;return pos+\'|\'+dur+\'|\'+p;})()"\n'
+    '          set meta to execute t javascript "(function(){var v=document.querySelector(\'video\');var p=v?(v.paused?1:0):-1;var b=document.querySelector(\'#progress-bar\');var n=b?parseFloat(b.getAttribute(\'aria-valuenow\')):NaN;var m=b?parseFloat(b.getAttribute(\'aria-valuemax\')):NaN;var pos=isFinite(n)?Math.floor(n):-1;var dur=(isFinite(m)&&m>0)?Math.floor(m):-1;var md=(navigator.mediaSession&&navigator.mediaSession.metadata)||{};var mt=md.title||\'\';var ma=md.artist||\'\';return pos+\'|\'+dur+\'|\'+p+\'\\t\'+mt+\'\\t\'+ma;})()"\n'
     '        end try\n'
     '        return ti & linefeed & u & linefeed & meta\n'
     '      end if\n'
@@ -415,7 +423,23 @@ def read_now_playing():
     parts = raw.splitlines()
     title, artist = parse_nowplaying_title(parts[0] if parts else "")
     url = parts[1].strip() if len(parts) > 1 else ""
-    pos, browser_dur, paused = parse_playback_meta(parts[2] if len(parts) > 2 else "")
+    # The meta line is "pos|dur|paused\tmediaTitle\tmediaArtist". A tab separator is
+    # used (not a newline) because AppleScript's double-quoted string literal eats
+    # \n/\r/\t escapes and turns them into real control chars in the JS source — a
+    # real newline there makes Chrome's `execute javascript` bridge yield "missing
+    # value". \t survives as a literal tab (valid inside a JS string), so it works;
+    # for the same reason the JS must not contain a /[\r\n\t]/ regex.
+    meta_fields = (parts[2] if len(parts) > 2 else "").split("\t")
+    pos, browser_dur, paused = parse_playback_meta(meta_fields[0])
+    # The tab title can lag or stay plain "YouTube Music" when a song is played from
+    # the home feed, so prefer the page's MediaSession metadata when present. Falls
+    # back to the tab title when JS is blocked (Allow JavaScript from Apple Events
+    # disabled) — same graceful degradation as pos/dur.
+    media_title = meta_fields[1].strip() if len(meta_fields) > 1 else ""
+    media_artist = meta_fields[2].strip() if len(meta_fields) > 2 else ""
+    if media_title:
+        title = media_title
+        artist = media_artist or artist
     meta = ytdlp_metadata(url, title, artist)
 
     if meta.get("title") and not meta.get("search"):
@@ -634,6 +658,29 @@ def lrclib_json(endpoint, params):
     return _lrclib_http(endpoint, params)
 
 
+# Strip "(feat. X)" / "[ft …]" / "(ร่วมกับ X)" / "(prod. …)" tails before fuzzy
+# compare, so a query that keeps the suffix still matches a candidate without it.
+_FEAT_RE = re.compile(
+    r"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring|with|prod\.?|ร่วมกับ)\b[^)\]]*[\)\]]?",
+    re.IGNORECASE,
+)
+_MATCH_PUNCT_RE = re.compile(r"[^\w\s]", re.UNICODE)
+
+
+def _norm_match_text(s):
+    """Normalize a title/artist for fuzzy comparison: lowercase, drop feat./ร่วมกับ
+    parentheticals and punctuation, collapse whitespace. Thai is left intact — no
+    unicode decomposition, which would split combining tone/vowel marks."""
+    s = (s or "").strip().lower()
+    s = _FEAT_RE.sub(" ", s)
+    s = _MATCH_PUNCT_RE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _fuzzy_ratio(a, b):
+    return difflib.SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
 def lrclib_score(candidate, title, artist, dur):
     score = 0
     cand_title = (candidate.get("trackName") or "").strip().lower()
@@ -644,10 +691,21 @@ def lrclib_score(candidate, title, artist, dur):
         score += 50
     elif want_title and want_title in cand_title:
         score += 20
+    elif want_title:
+        # Slightly-wrong title (typo, dropped feat. suffix, punctuation): grade by
+        # fuzzy similarity of the normalized strings so a near-match still ranks.
+        # Strictly additive — exact/substring hits above are untouched.
+        ratio = _fuzzy_ratio(_norm_match_text(title), _norm_match_text(cand_title))
+        if ratio >= 0.6:
+            score += int(40 * ratio)
     if want_artist and cand_artist == want_artist:
         score += 30
     elif want_artist and want_artist in cand_artist:
         score += 10
+    elif want_artist:
+        ratio = _fuzzy_ratio(_norm_match_text(artist), _norm_match_text(cand_artist))
+        if ratio >= 0.6:
+            score += int(20 * ratio)
     cand_dur = int(candidate.get("duration") or 0)
     if dur and dur > 0 and cand_dur > 0:
         delta = abs(cand_dur - int(dur))
@@ -803,32 +861,37 @@ def synced_lyric_payload(lines, pos):
     current = lines[idx][1] if idx >= 0 else ""
     next_idx = idx + 1
     next_line = lines[next_idx][1] if next_idx < len(lines) else ""
+    third_idx = idx + 2
+    third_line = lines[third_idx][1] if third_idx < len(lines) else ""
     # Firmware stores lt as integer seconds. Round up so a fractional LRC stamp
     # never promotes the next line early.
     next_at = int(lines[next_idx][0] + 0.999) if next_idx < len(lines) else -1
-    return current, next_line, next_at, idx
+    third_at = int(lines[third_idx][0] + 0.999) if third_idx < len(lines) else -1
+    return current, next_line, third_line, next_at, third_at, idx
 
 
 def lyric_payload(title, artist, pos, dur, paused, now, state):
-    """Return (lyric, lyric2, lt) for the current tick."""
+    """Return (lyric, lyric2, lyric3, lt, lt2) for the current tick."""
     key = lyric_key(title, artist, dur)
     if key != state.get("key"):
         state.clear()
         state.update({"key": key, "plain_index": 0, "plain_last": now, "synced_index": None})
 
     if key is None:
-        return "", "", -1
+        return "", "", "", -1, -1
 
     parsed = fetch_lyrics(title, artist, dur)
     synced = parsed.get("synced") or []
     if synced and pos >= 0:
-        lyric, lyric2, next_at, idx = synced_lyric_payload(synced, pos + LYRIC_SYNC_OFFSET)
+        lyric, lyric2, lyric3, next_at, third_at, idx = synced_lyric_payload(
+            synced, pos + LYRIC_SYNC_OFFSET
+        )
         state["synced_index"] = idx
-        return lyric, lyric2, next_at
+        return lyric, lyric2, lyric3, next_at, third_at
 
     plain = parsed.get("plain") or []
     if not plain:
-        return "", "", -1
+        return "", "", "", -1, -1
 
     # Plain (unsynced) lyrics have no timestamps, so we advance them on a wall-clock
     # cadence — but only while playing. While paused, hold the line and keep the timer
@@ -846,10 +909,17 @@ def lyric_payload(title, artist, pos, dur, paused, now, state):
             state["plain_index"] = min(len(plain) - 1, state.get("plain_index", 0) + steps)
             state["plain_last"] = now
     idx = state.get("plain_index", 0)
-    return plain[idx], plain[idx + 1] if idx + 1 < len(plain) else "", -1
+    return (
+        plain[idx],
+        plain[idx + 1] if idx + 1 < len(plain) else "",
+        plain[idx + 2] if idx + 2 < len(plain) else "",
+        -1,
+        -1,
+    )
 
 
-def push_now_playing(title, artist, pos=-1, dur=-1, paused=-1, lyric="", lyric2="", lt=-1):
+def push_now_playing(title, artist, pos=-1, dur=-1, paused=-1,
+                     lyric="", lyric2="", lyric3="", lt=-1, lt2=-1):
     """Best-effort push of the current song. UTF-8 is preserved (Thai stays Thai)."""
     quote = urllib.parse.quote
     # Defensive cap: the device clips lyric lines at the panel edge (no marquee), so a
@@ -857,12 +927,15 @@ def push_now_playing(title, artist, pos=-1, dur=-1, paused=-1, lyric="", lyric2=
     # Title/artist are intentionally NOT capped — they marquee-scroll on the device.
     lyric = lyric[:MAX_LYRIC_CHARS]
     lyric2 = lyric2[:MAX_LYRIC_CHARS]
+    lyric3 = lyric3[:MAX_LYRIC_CHARS]
     url = (f"{DEVICE_URL}/nowplaying?title={quote(title, safe='')}"
            f"&artist={quote(artist, safe='')}"
            f"&pos={int(pos)}&dur={int(dur)}&paused={int(paused)}")
     url += (f"&lyric={quote(lyric, safe='')}"
             f"&lyric2={quote(lyric2, safe='')}"
-            f"&lt={int(lt)}")
+            f"&lyric3={quote(lyric3, safe='')}"
+            f"&lt={int(lt)}"
+            f"&lt2={int(lt2)}")
     try:
         device_post(url)
         shown = title or "— Not Playing —"
@@ -1095,7 +1168,7 @@ def main():
     # song still differs from this and pushes.
     last_song = ("", "", -1, -1, -1)
     lyric_state = {}
-    last_lyric_payload = ("", "", -1)
+    last_lyric_payload = ("", "", "", -1, -1)
     last_nowplaying_push = 0.0
     while True:
         now = time.monotonic()
@@ -1119,11 +1192,21 @@ def main():
         )
         last_song = song
         if state_changed or lyric_changed or resync_due:
-            push_now_playing(*song, lyric=lyrics[0], lyric2=lyrics[1], lt=lyrics[2])
+            push_now_playing(
+                *song,
+                lyric=lyrics[0],
+                lyric2=lyrics[1],
+                lyric3=lyrics[2],
+                lt=lyrics[3],
+                lt2=lyrics[4],
+            )
             last_nowplaying_push = now
             last_lyric_payload = lyrics
 
-        time.sleep(NOWPLAYING_TICK)
+        # Read fast (4s) while a song tab is open, slow when idle. Cap the sleep to the
+        # next usage deadline so a long idle tick never delays the 60s usage poll.
+        tick = NOWPLAYING_TICK if title else NOWPLAYING_IDLE_TICK
+        time.sleep(max(0.0, min(tick, next_usage - time.monotonic())))
 
 
 if __name__ == "__main__":
