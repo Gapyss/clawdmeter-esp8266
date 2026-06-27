@@ -100,17 +100,23 @@ reset metadata, and simple Mac system metrics.
   instruction RAM with the same code. Adding `ICACHE_RAM_ATTR`/`IRAM_ATTR` code can
   still overflow `iram1`, so avoid new ISR/timer-heavy features.
 - **The MAC screen repaints in two phases — never `fillScreen` on a `/usage` push.**
-  The MAC view is a System-7 *About This Macintosh* window (menu bar + Finder clock,
-  pinstripe title bar, compact-Mac icon, and four 1-bit thermometer rows: CPU / Memory /
-  Disk / Battery, black fill that turns `C_RED` in the danger zone — CPU/MEM/DISK ≥ 85 %
-  or Battery ≤ 20 %, via `macMetricDanger`). A full `fillScreen` every 60 s flashes the
-  panel white and kills the glance-all-day feel, so `drawMacMeter()` is split: the static
-  chrome (`drawMacChrome`) is drawn **once** on switch-in, gated by the file-scope
-  `macChromeReady` flag (cleared to `false` whenever the screen is forced to MAC, line
-  ~618); every `/usage` push and the per-minute tick then run only `drawMacDynamic()`,
-  which repaints the clock, uptime, four bar interiors + numerals, and the stale `!`
-  marker with **opaque white-bg prints** (no clear-flash). Same discipline as the desk
-  canvas: don't reintroduce a `fillScreen`/full-body `fillRect` into the dynamic path.
+  The MAC view is a **Tend "paper" system card** (warm cream `C_TND_PAPER`, the shared
+  Tend palette aliased from the music screen's `C_MUS_*` tokens): an ember hearth-flame
+  mark + `YOUR MAC` eyebrow + wall clock in the header, a `clawdmeter` title with an
+  uptime caption, then four calm metric rows — cpu / memory / disk / battery, each a
+  lowercase label, a numeral, and a slim rounded Tend progress bar. Per Tend, **ember is
+  the one loud color, reserved for the danger state**: a healthy bar fills quiet moss
+  (`C_TND_MOSS`) and only turns ember (`C_TND_EMBER`, numeral too) in the danger zone —
+  CPU/MEM/DISK ≥ 85 % or Battery ≤ 20 %, via `macMetricDanger`. A full `fillScreen` every
+  60 s flashes the panel and kills the glance-all-day feel, so `drawMacMeter()` is split:
+  the static chrome (`drawMacChrome`, which paints the paper background itself) is drawn
+  **once** on switch-in, gated by the file-scope `macChromeReady` flag (cleared to `false`
+  whenever the screen is forced to MAC); every `/usage` push and the per-minute tick then
+  run only `drawMacDynamic()`, which repaints the clock, uptime, and four numerals + bar
+  fills with **opaque paper-bg prints** (no clear-flash). When data goes stale (>2 min
+  with no push) a faint lowercase `stale` word appears by the uptime — Tend **bans
+  exclamation marks**, so there is no `!` badge. Same discipline as the desk card: don't
+  reintroduce a `fillScreen`/full-body `fillRect` into the dynamic path.
 - **Use hex color literals (`0x0000`/`0xFFFF`), not Arduino_GFX `BLACK`/`WHITE`.**
   The named macros fail to resolve inside the non-capturing lambda used for
   `wm.setAPCallback`.
@@ -150,22 +156,28 @@ runtime-only (not persisted), defaults to idle, and is reported as `face` in
 `/usage.json` ·
 `GET|POST /desk?status=coding|meeting|busy|break|claude` pushes a preset desk status word;
 `/desk?text=<up-to-12-safe-chars>&color=green|red|amber|blue|white|claude` pushes custom text.
-The physical desk screen is a **classic MacPaint window** (`drawDeskSign`): a white menu bar
-(`File Edit Goodies Font FontSize Style`), a left 2×8 tool-glyph palette, an "untitled"
-document window, and a bottom pattern-swatch strip. The status word — preset or custom — is
-**typed in black ink on the white canvas** (current default GFX font, single centered line,
-typewriter + blinking cursor via `deskDisplayText`; size auto-drops 4→3→2 so 12 chars fit).
-The chrome is drawn **once** by `drawDeskSign` on switch-in; only the canvas text region is
-repainted on the ~120 ms animation tick (opaque white-bg in-place print, no per-frame clear),
-so don't reintroduce a full canvas `fillRect` in that path. The `color` param (and the preset
-status color) is accepted/persisted only to tint the **dashboard dot** — it does **not** tint
-the physical sign, which is monochrome black-on-white. No clock/quote/IP on this screen
-(device stays reachable at `clawdmeter.local`) ·
-`GET|POST /nowplaying?title=&artist=&pos=&dur=&paused=&lyric=&lyric2=&lt=` pushes the
-**YouTube Music now-playing** song (the daemon reads it from a Chrome tab title via AppleScript
-and URL-encodes UTF-8 — Thai is preserved, not ASCII-stripped). `lyric` and `lyric2` are the
-current/upcoming lyric lines from lrclib.net; `lt` is the next-line playback position in seconds,
-or `-1` when the daemon is driving plain-lyric fallback timing. **Now-playing is a web-only
+The physical desk screen is a **Tend "paper" status card** (`drawDeskSign`, same warm cream
+palette as the MAC/music screens): an ember hearth-flame mark + `STATUS` eyebrow in the header,
+the status word centered in the body, and a short color-tinted accent rule beneath it. The
+status word — preset or custom — is **typed in lowercase deep-olive ink on the paper**
+(`C_TND_INK`, default GFX font, single centered line, typewriter + blinking cursor via
+`deskDisplayText`; size auto-drops 4→3→2 so 12 chars fit). Unlike the old monochrome MacPaint
+sign, the `color` param (and preset status color) now **also tints the physical accent rule**
+via `deskAccentColor` (busy/red→ember, break/amber→marigold, meeting/blue→sky, claude→Claude
+orange, white→ink, green/default→moss) — as well as the dashboard dot. The card is fully
+redrawn by `drawDeskSign` on switch-in and on every `/desk` push (the push runs through
+`drawMeter`→`drawDeskSign`); only the word region animates in place on the ~120 ms tick
+(opaque paper-bg in-place print, no per-frame clear), so don't reintroduce a full `fillRect`
+into that tick path. No clock on this screen — it stays deliberately uncrowded, matching Tend's
+calm ethos (device remains reachable at `clawdmeter.local`) ·
+`GET|POST /nowplaying?title=&artist=&pos=&dur=&paused=&lyric=&lyric2=&lyric3=&lt=&lt2=` pushes the
+**YouTube Music now-playing** song (the daemon reads it from the Chrome tab's `navigator.mediaSession`
+metadata via AppleScript, falling back to the tab *title* when page JS is blocked — the bare tab
+title often stays "YouTube Music" when a song is played from the home feed, so MediaSession is
+preferred; values are URL-encoded UTF-8 — Thai is preserved, not ASCII-stripped). `lyric`, `lyric2`, and `lyric3`
+are the current/upcoming/look-ahead lyric lines from lrclib.net; `lt` and `lt2` are the next two
+line playback positions in seconds, or `-1` when the daemon is driving plain-lyric fallback timing.
+**Now-playing is a web-only
 feature: the endpoint stores the song but does NOT switch the physical LCD** — the dashboard's
 "Now Playing" panel (toggled by a top-bar button) reads the state from `/usage.json`. The physical
 `music` screen is selected via `/mode?screen=music` — either directly, or by **opening** the
@@ -173,13 +185,12 @@ dashboard's "Now Playing" panel, whose toggle button now also requests `/mode?sc
 daemon's `/nowplaying` push still never steals focus on its own); if MUSIC happens to be the
 current screen a track/pause change repaints it in place (chrome stays put, no flash), while
 position/lyric resyncs repaint only the progress/time footer and lyric band. The physical screen
-is the Tend-style "Now Playing 240" card: cream paper (`#F8F3E1`), deep-olive ink, ember accent,
-warm bark vinyl-disc art on the left, title/artist meta column on the right, a thin ember progress
-bar with elapsed and remaining time, and a two-line lyric band replacing the source design's
-bottom transport controls. There are no animated EQ bars. The header is a small `NOW PLAYING` /
-`PAUSED` eyebrow plus clock, redrawn on switch-in, pause/identity changes, and minute rollover
-only. Title and artist marquees are advanced by a `millis()` poll in `loop()` — **not** a timer
-ISR, same reason as `face`.
+is the dark "Arduino Music Display" layout: warm-ink background, cream title, dim artist,
+waveform mark in the header, a two-line lyric zone with a large scrolling current lyric and
+dim upcoming lyric, plus a bottom elapsed/progress/total zone. There is no wall
+clock and no `NOW PLAYING` / `PAUSED` eyebrow in this layout; pause state is conveyed by dimming
+the footer/progress accents. Title, artist, and current-lyric marquees are advanced by a
+`millis()` poll in `loop()` — **not** a timer ISR, same reason as `face`.
 Title/artist/lyric lines are echoed in `/usage.json` (JSON-escaped) for `curl` debugging. **Thai/Latin text
 is drawn from bundled Ayuthaya GFXfont tables (`thai_font.h`)**, not the built-in 5×7 font: that
 font is ASCII-only and Arduino_GFX's `drawChar()` can't index code points > 255, so
