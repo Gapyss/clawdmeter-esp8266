@@ -869,6 +869,22 @@ void handleFactoryReset() {
 #define C_MUS_BARK       0x8B68  // #8B6F47 vinyl disc rings (warm earth)
 #define C_MUS_BARK_DEEP  0x6A86  // #6B5236 vinyl disc grooves
 
+// The MAC + desk screens share the same Tend paper palette as music. Alias the
+// tokens to screen-neutral C_TND_* names, and add the calm pillar/semantic
+// accents those screens need. Per Tend, EMBER is the one loud color — reserved
+// for the danger/alert state; healthy values stay quiet (moss / earth / ink).
+#define C_TND_PAPER      C_MUS_PAPER       // #F8F3E1 warm paper surface
+#define C_TND_PAPER_DEEP C_MUS_PAPER_DEEP  // #EDE6CB sunken progress track
+#define C_TND_LINE       C_MUS_PAPER_LINE  // #D3C8A2 hairline divider
+#define C_TND_INK        C_MUS_INK         // #1F1D11 primary text / numerals
+#define C_TND_INK_SOFT   C_MUS_INK_SOFT    // #5B5536 secondary (row labels)
+#define C_TND_MUTE       C_MUS_INK_MUTED   // #948D6F tertiary (eyebrow / clock)
+#define C_TND_FAINT      C_MUS_INK_FAINT   // #C5BD96 faint (stale marker)
+#define C_TND_EMBER      C_MUS_EMBER       // #E85D3C loud accent — danger / fire
+#define C_TND_MOSS       0x6C6B            // #6B8E5A quiet pillar green — healthy fill
+#define C_TND_WARN       0xF504            // #F4A226 marigold — flame glow / amber status
+#define C_TND_INFO       0x2C75            // #2E8FAB fresh sky — blue status
+
 // Display clock/reset times in Thailand time. Pushed epochs are UTC; add the
 // offset only when formatting wall-clock text (durations/countdowns stay raw).
 #define TZ_OFFSET 25200UL   // Asia/Bangkok, UTC+7 (no DST)
@@ -1033,13 +1049,6 @@ static void drawMetricRow(int y, const char *label, int pct, int barX, int barW)
   drawProgressBar(barX, y + 13, barW, 12, pct);
 }
 
-static void drawMacClock() {
-  unsigned long e = nowEpoch();
-  String t = e ? hhmm(e + TZ_OFFSET) : String("--:--");
-  gfx->fillRect(184, 2, 52, 10, C_WHITE);
-  printRight(236, 2, 1, t, C_BLACK, C_WHITE);
-}
-
 static String uptimePlainText() {
   unsigned long totalHours = millis() / 3600000UL;
   unsigned long days = totalHours / 24UL;
@@ -1047,112 +1056,104 @@ static String uptimePlainText() {
   return String(days) + "d " + pad2(hours) + "h";
 }
 
-static void drawMacApple(int x, int y) {
-  gfx->fillCircle(x + 4, y + 6, 3, C_BLACK);
-  gfx->fillCircle(x + 8, y + 6, 3, C_BLACK);
-  gfx->fillCircle(x + 6, y + 9, 4, C_BLACK);
-  gfx->fillCircle(x + 10, y + 5, 2, C_WHITE);
-  gfx->drawLine(x + 6, y + 1, x + 9, y, C_BLACK);
-}
-
-static void drawCompactMacIcon(int x, int y) {
-  gfx->drawRect(x, y, 30, 34, C_BLACK);
-  gfx->drawRect(x + 4, y + 5, 22, 16, C_BLACK);
-  gfx->fillRect(x + 7, y + 8, 16, 10, C_BLACK);
-  gfx->drawFastHLine(x + 7, y + 25, 15, C_BLACK);
-  gfx->fillRect(x + 5, y + 32, 5, 2, C_BLACK);
-  gfx->fillRect(x + 20, y + 32, 5, 2, C_BLACK);
-}
-
-static void drawMacRowChrome(int y, const char *label) {
-  gfx->setTextSize(1);
-  gfx->setTextColor(C_BLACK, C_WHITE);
-  gfx->setCursor(18, y + 4);
-  gfx->print(label);
-  gfx->drawRect(76, y, 96, 14, C_BLACK);
-}
-
 static bool macMetricDanger(int pct, bool battery) {
   if (pct < 0) return false;
   return battery ? (pct <= 20) : (pct >= 85);
 }
 
-static void drawMacRowDynamic(int y, int pct, bool battery) {
-  const int barX = 76;
-  const int barY = y;
-  const int barW = 96;
-  const int barH = 14;
-  gfx->fillRect(barX + 2, barY + 2, barW - 4, barH - 4, C_WHITE);
-  if (pct > 0) {
-    int p = pct > 100 ? 100 : pct;
-    uint16_t fill = macMetricDanger(pct, battery) ? C_RED : C_BLACK;
-    gfx->fillRect(barX + 2, barY + 2, (barW - 4) * p / 100, barH - 4, fill);
-  }
-
-  gfx->fillRect(178, y - 1, 50, 18, C_WHITE);
-  printRight(226, y, 2, pctText(pct), C_BLACK, C_WHITE);
+// Tend's hearth mark: a tiny ember flame, drawn from primitives like
+// drawClaudeIcon. Shared by the MAC and desk screen headers — the fire/hearth
+// metaphor at the heart of the design. (cx, cy) is the flame's visual center.
+static void drawTendFlame(int cx, int cy) {
+  gfx->fillCircle(cx, cy + 3, 5, C_TND_EMBER);                          // rounded base
+  gfx->fillTriangle(cx - 5, cy + 3, cx + 5, cy + 3, cx, cy - 7, C_TND_EMBER); // tapered tip
+  gfx->fillCircle(cx, cy + 4, 2, C_TND_WARN);                          // warm inner glow
 }
 
-static void drawMacStaleMarker() {
-  bool stale = (lastUpdateMs != 0) && (millis() - lastUpdateMs > 120000UL);
-  gfx->fillRect(220, 20, 9, 9, C_WHITE);
-  if (!stale) return;
-  gfx->drawRect(220, 20, 9, 9, C_BLACK);
+// MAC screen — a Tend "paper" system card (replaces the old System-7 window).
+// Layout: ember hearth mark + "YOUR MAC" eyebrow + wall clock in the header,
+// the "clawdmeter" title with an uptime caption, then four calm metric rows
+// (cpu / memory / disk / battery). Each row is a label, a mono-ish numeral, and
+// a slim rounded Tend progress bar — quiet moss fill when healthy, loud ember
+// only in the danger zone (cpu/mem/disk >= 85 % or battery <= 20 %). Two-phase
+// repaint: chrome once on switch-in, values in place every push/tick.
+static const int MAC_PAD = 14;
+static const int MAC_ROW_Y[4] = { 92, 129, 166, 203 };
+
+static void drawMacRowLabel(int rowY, const char *label) {
   gfx->setTextSize(1);
-  gfx->setTextColor(C_BLACK, C_WHITE);
-  gfx->setCursor(223, 21);
-  gfx->print("!");
+  gfx->setTextColor(C_TND_INK_SOFT, C_TND_PAPER);
+  gfx->setCursor(MAC_PAD, rowY + 2);
+  gfx->print(label);
+}
+
+static void drawMacRow(int rowY, int pct, bool battery) {
+  const int w = 240 - MAC_PAD * 2;
+  const int barY = rowY + 14, barH = 7, rad = barH / 2;
+  bool danger = macMetricDanger(pct, battery);
+  uint16_t fill = danger ? C_TND_EMBER : C_TND_MOSS;
+  uint16_t numC = danger ? C_TND_EMBER : C_TND_INK;
+
+  // Numeral, right-aligned, opaque paper bg over a fixed clear zone (width varies).
+  gfx->fillRect(150, rowY - 4, 76, 16, C_TND_PAPER);
+  printRight(226, rowY - 4, 2, pctText(pct), numC, C_TND_PAPER);
+
+  // Rounded track (also clears the previous fill so a shrinking % leaves nothing).
+  gfx->fillRoundRect(MAC_PAD, barY, w, barH, rad, C_TND_PAPER_DEEP);
+  if (pct > 0) {
+    int p = pct > 100 ? 100 : pct;
+    int fw = w * p / 100;
+    if (fw < barH) fw = barH;                       // keep the pill renderable at low %
+    gfx->fillRoundRect(MAC_PAD, barY, fw, barH, rad, fill);
+  }
 }
 
 static void drawMacChrome() {
-  gfx->fillRect(0, 0, 240, 15, C_WHITE);
-  drawMacApple(4, 2);
+  gfx->fillScreen(C_TND_PAPER);
+
+  drawTendFlame(16, 13);
   gfx->setTextSize(1);
-  gfx->setTextColor(C_BLACK, C_WHITE);
-  gfx->setCursor(20, 3);
-  gfx->print("Finder");
-  gfx->drawFastHLine(0, 14, 240, C_BLACK);
+  gfx->setTextColor(C_TND_MUTE, C_TND_PAPER);
+  gfx->setCursor(30, 8);
+  gfx->print("YOUR MAC");                            // eyebrow
+  gfx->drawFastHLine(MAC_PAD, 30, 240 - MAC_PAD * 2, C_TND_LINE);
 
-  gfx->drawFastVLine(234, 18, 221, C_BLACK);
-  gfx->drawFastHLine(8, 238, 227, C_BLACK);
-  gfx->fillRect(6, 16, 228, 222, C_WHITE);
-  gfx->drawRect(6, 16, 228, 222, C_BLACK);
+  gfx->setTextSize(2);
+  gfx->setTextColor(C_TND_INK, C_TND_PAPER);
+  gfx->setCursor(MAC_PAD, 40);
+  gfx->print("clawdmeter");                          // title
 
-  for (int y = 19; y <= 31; y += 2) gfx->drawFastHLine(8, y, 224, C_BLACK);
-  gfx->fillRect(91, 18, 120, 14, C_WHITE);
-  gfx->drawRect(13, 20, 9, 9, C_BLACK);
-  printCentered(21, 1, String("About This Macintosh"), C_BLACK, C_WHITE);
-  gfx->drawFastHLine(6, 34, 228, C_BLACK);
-
-  drawCompactMacIcon(24, 48);
-  gfx->setTextColor(C_BLACK, C_WHITE);
-  gfx->setTextSize(1);
-  gfx->setCursor(68, 52);
-  gfx->print("System Software 7.1");
-  gfx->setCursor(68, 66);
-  gfx->print("Clawdmeter");
-  gfx->drawFastHLine(16, 96, 208, C_BLACK);
-
-  drawMacRowChrome(116, "CPU");
-  drawMacRowChrome(140, "Memory");
-  drawMacRowChrome(164, "Disk");
-  drawMacRowChrome(188, "Battery");
+  drawMacRowLabel(MAC_ROW_Y[0], "cpu");
+  drawMacRowLabel(MAC_ROW_Y[1], "memory");
+  drawMacRowLabel(MAC_ROW_Y[2], "disk");
+  drawMacRowLabel(MAC_ROW_Y[3], "battery");
 }
 
 static void drawMacDynamic() {
-  drawMacClock();
+  // Wall clock, right of the eyebrow (opaque paper bg, width varies).
+  unsigned long e = nowEpoch();
+  String t = e ? hhmm(e + TZ_OFFSET) : String("--:--");
+  gfx->fillRect(180, 8, 46, 8, C_TND_PAPER);
+  printRight(226, 8, 1, t, C_TND_MUTE, C_TND_PAPER);
 
-  gfx->fillRect(68, 66, 132, 10, C_WHITE);
+  // Uptime caption; a faint "stale" word appears when no push for >2 min. Tend
+  // bans exclamation marks, so the old "!" badge is gone — this stays quiet.
+  bool stale = (lastUpdateMs != 0) && (millis() - lastUpdateMs > 120000UL);
+  gfx->fillRect(MAC_PAD, 60, 200, 8, C_TND_PAPER);
   gfx->setTextSize(1);
-  gfx->setTextColor(C_BLACK, C_WHITE);
-  gfx->setCursor(68, 66);
-  gfx->print("Clawdmeter up " + uptimePlainText());
+  gfx->setTextColor(C_TND_MUTE, C_TND_PAPER);
+  gfx->setCursor(MAC_PAD, 60);
+  gfx->print("up " + uptimePlainText());
+  if (stale) {
+    gfx->setTextColor(C_TND_FAINT, C_TND_PAPER);
+    gfx->setCursor(150, 60);
+    gfx->print("stale");
+  }
 
-  drawMacStaleMarker();
-  drawMacRowDynamic(116, macCpuPct, false);
-  drawMacRowDynamic(140, macMemPct, false);
-  drawMacRowDynamic(164, macDiskPct, false);
-  drawMacRowDynamic(188, macBatteryPct, true);
+  drawMacRow(MAC_ROW_Y[0], macCpuPct, false);
+  drawMacRow(MAC_ROW_Y[1], macMemPct, false);
+  drawMacRow(MAC_ROW_Y[2], macDiskPct, false);
+  drawMacRow(MAC_ROW_Y[3], macBatteryPct, true);
 }
 
 // Typewriter frame for a desk label: types it in one char at a time, blinks a
@@ -1171,12 +1172,29 @@ static String deskDisplayText(const String &label) {
   return label.substring(0, chars) + (cursorOn ? "|" : " ");
 }
 
-// The MacPaint window "canvas": the white drawing area the typed text lives in.
-// (x..x+w, y..y+h) = 39..238 wide, 29..199 tall. drawDeskSign fills it white once.
-#define DESK_CANVAS_X 39
-#define DESK_CANVAS_Y 29
-#define DESK_CANVAS_W 200
-#define DESK_CANVAS_H 171
+// The desk word lives on a Tend paper card. It is centered in this body region —
+// below the header divider, above the color accent rule. Text size auto-drops
+// 4 -> 3 -> 2 so up to 12 chars fit the 240-wide panel.
+#define DESK_BODY_Y 44
+#define DESK_BODY_H 148
+
+static uint8_t deskTextSize(const String &label) {
+  int full = (int)label.length() + 1;      // word + cursor
+  const int w = 240 - 28;                   // body width with side margins
+  return (full * 24 <= w) ? 4 : (full * 18 <= w) ? 3 : 2;
+}
+
+// Map the desk color name to a Tend accent for the on-card rule. Ember stays the
+// one loud color (busy / red); green -> moss, amber -> marigold, blue -> sky,
+// claude -> Claude orange, white -> ink.
+static uint16_t deskAccentColor() {
+  if (deskColorName == "red")    return C_TND_EMBER;
+  if (deskColorName == "amber")  return C_TND_WARN;
+  if (deskColorName == "blue")   return C_TND_INFO;
+  if (deskColorName == "claude") return C_CLAUDE;
+  if (deskColorName == "white")  return C_TND_INK;
+  return C_TND_MOSS;                         // green / default
+}
 
 static void drawDeskStatusText(const String &label) {
   String shown = deskDisplayText(label);
@@ -1184,33 +1202,30 @@ static void drawDeskStatusText(const String &label) {
   deskLastShown = shown;
 
   // Size from the full label (+cursor) so it stays constant through the type-in,
-  // and center on the canvas at the final width so letters land in place instead
-  // of re-centering — and jittering — on every frame. Drop a size if the word
-  // won't fit the canvas (12 chars only fit at size 2).
-  int full = (int)label.length() + 1;
-  uint8_t textSize = (full * 24 <= DESK_CANVAS_W - 8) ? 4
-                   : (full * 18 <= DESK_CANVAS_W - 8) ? 3 : 2;
-  int x = DESK_CANVAS_X + (DESK_CANVAS_W - textWidth(label + "|", textSize)) / 2;
-  if (x < DESK_CANVAS_X + 1) x = DESK_CANVAS_X + 1;
-  int y = DESK_CANVAS_Y + (DESK_CANVAS_H - 8 * textSize) / 2;
+  // and center on the panel at the final width so letters land in place instead
+  // of re-centering — and jittering — on every frame.
+  uint8_t textSize = deskTextSize(label);
+  int x = (240 - textWidth(label + "|", textSize)) / 2;
+  if (x < 2) x = 2;
+  int y = DESK_BODY_Y + (DESK_BODY_H - 8 * textSize) / 2;
 
-  // Pad to a constant-width field and print with an OPAQUE white background
-  // instead of wiping the canvas first. Already-typed glyphs get overwritten
-  // with the same pixels (no visible flash), trailing/erased cells are cleared
-  // by the space glyphs' white background, so only the changed cell flips.
+  // Pad to a constant-width field and print with an OPAQUE paper background
+  // instead of wiping first. Already-typed glyphs get overwritten with the same
+  // pixels (no visible flash); trailing/erased cells are cleared by the space
+  // glyphs' paper background, so only the changed cell flips.
   String field = shown;
   while (field.length() < label.length() + 1) field += " ";
   gfx->setTextSize(textSize);
-  gfx->setTextColor(C_BLACK, C_WHITE);     // black ink on the white canvas
+  gfx->setTextColor(C_TND_INK, C_TND_PAPER);   // deep-olive ink on paper
   gfx->setCursor(x, y);
   gfx->print(field);
 }
 
 static void drawDeskAnimatedStatus() {
-  // MacPaint is black ink on a white canvas — presets and custom text alike.
-  // (Preset/custom color still drives the dashboard dot via deskColorName.)
+  // Tend voice: the status word is calm, lowercase ink on paper. The color name
+  // still drives the dashboard dot AND the on-card accent rule (deskAccentColor).
   String label = deskText;
-  label.toUpperCase();
+  label.toLowerCase();
   if (label.length() > 12) label = label.substring(0, 12);
   drawDeskStatusText(label);
 }
@@ -1292,7 +1307,7 @@ void tickDynamic() {
   if (e == 0) return;
 
   if (lcdScreen == SCREEN_DESK) {
-    drawDeskAnimatedStatus();   // no clock on the MacPaint canvas; typewriter only
+    drawDeskAnimatedStatus();   // no clock on the desk card; typewriter only
     return;
   }
 
@@ -1313,137 +1328,42 @@ void tickDynamic() {
 
 void drawMacMeter() {
   if (!macChromeReady) {
-    gfx->fillScreen(C_WHITE);
-    drawMacChrome();
+    drawMacChrome();           // paints the paper background itself
     macChromeReady = true;
   }
   drawMacDynamic();
 }
 
-// One swatch of the MacPaint pattern palette: a small black-on-white fill drawn
-// pixel by pixel. Static (draw-once), so the per-pixel cost doesn't matter.
-static void drawDeskPattern(int x, int y, int w, int h, int type) {
-  switch (type & 7) {
-    case 0: break;                                   // white / empty
-    case 1: gfx->fillRect(x, y, w, h, C_BLACK); break;  // solid
-    default:
-      for (int yy = 0; yy < h; yy++)
-        for (int xx = 0; xx < w; xx++) {
-          bool on = false;
-          switch (type & 7) {
-            case 2: on = (xx + yy) & 1; break;       // checker
-            case 3: on = (yy & 1) == 0; break;       // horizontal lines
-            case 4: on = (xx & 1) == 0; break;       // vertical lines
-            case 5: on = (xx % 3 == 0) && (yy % 3 == 0); break;  // sparse dots
-            case 6: on = (xx + yy) % 3 == 0; break;  // diagonal
-            case 7: on = (xx & 1) == 0 && (yy & 1) == 0; break;  // grid
-          }
-          if (on) gfx->drawPixel(x + xx, y + yy, C_BLACK);
-        }
-  }
-}
-
-// A tiny simplified MacPaint tool glyph centered in its cell.
-static void drawDeskToolGlyph(int cx, int cy, int i) {
-  switch (i) {
-    case 0:  gfx->drawRect(cx - 5, cy - 4, 10, 8, C_BLACK); break;          // marquee
-    case 1:  gfx->drawCircle(cx - 1, cy - 1, 4, C_BLACK);
-             gfx->drawLine(cx - 1, cy + 3, cx + 4, cy + 4, C_BLACK); break; // lasso
-    case 2:  gfx->fillRect(cx - 4, cy - 3, 8, 6, C_BLACK); break;           // hand/select
-    case 3:  gfx->setTextSize(1); gfx->setTextColor(C_BLACK, C_WHITE);
-             gfx->setCursor(cx - 3, cy - 3); gfx->print('A'); break;        // text
-    case 4:  gfx->fillTriangle(cx - 4, cy - 3, cx + 4, cy - 3, cx, cy + 4, C_BLACK); break; // bucket
-    case 5:  for (int d = 0; d < 7; d++)
-               gfx->drawPixel(cx - 3 + (d * 5 % 8), cy - 3 + (d * 3 % 7), C_BLACK); break;  // spray
-    case 6:  gfx->drawLine(cx - 4, cy + 4, cx + 3, cy - 3, C_BLACK);
-             gfx->drawLine(cx - 3, cy + 4, cx + 4, cy - 3, C_BLACK); break; // brush
-    case 7:  gfx->drawLine(cx - 4, cy + 4, cx + 4, cy - 4, C_BLACK);
-             gfx->fillRect(cx + 3, cy - 4, 2, 2, C_BLACK); break;           // pencil
-    case 8:  gfx->drawLine(cx - 5, cy + 4, cx + 5, cy - 4, C_BLACK); break; // line
-    case 9:  gfx->drawRect(cx - 5, cy - 3, 10, 7, C_BLACK); break;          // eraser
-    case 10: gfx->drawRect(cx - 5, cy - 4, 10, 8, C_BLACK); break;          // rect
-    case 11: gfx->drawRoundRect(cx - 5, cy - 4, 10, 8, 3, C_BLACK); break;  // round rect
-    case 12: gfx->drawCircle(cx, cy, 4, C_BLACK); break;                    // oval
-    case 13: gfx->drawLine(cx - 5, cy + 2, cx - 2, cy - 3, C_BLACK);
-             gfx->drawLine(cx - 2, cy - 3, cx + 1, cy + 2, C_BLACK);
-             gfx->drawLine(cx + 1, cy + 2, cx + 4, cy - 3, C_BLACK); break; // freeform
-    case 14: gfx->fillRect(cx - 5, cy - 4, 10, 8, C_BLACK); break;          // filled rect
-    default: gfx->fillCircle(cx, cy, 4, C_BLACK); break;                    // filled oval
-  }
-}
-
-// The left MacPaint tool palette: a white 2x8 grid of tool glyphs.
-static void drawDeskToolPalette() {
-  const int px = 0, py = 15, pw = 36, ph = 186;
-  const int cols = 2, rows = 8, cw = pw / cols, ch = ph / rows;
-  gfx->fillRect(px, py, pw, ph, C_WHITE);
-  gfx->drawRect(px, py, pw, ph, C_BLACK);
-  for (int i = 1; i < cols; i++) gfx->drawFastVLine(px + i * cw, py, ph, C_BLACK);
-  for (int j = 1; j < rows; j++) gfx->drawFastHLine(px, py + j * ch, pw, C_BLACK);
-  for (int r = 0; r < rows; r++)
-    for (int col = 0; col < cols; col++)
-      drawDeskToolGlyph(px + col * cw + cw / 2, py + r * ch + ch / 2, r * cols + col);
-}
-
-// The bottom MacPaint palette: line-width box on the left, pattern swatches right.
-static void drawDeskPatternStrip() {
-  const int sy = 202, sh = 38;
-  gfx->fillRect(0, sy, 240, sh, C_WHITE);
-  gfx->drawRect(0, sy, 240, sh, C_BLACK);
-
-  // line-width selector box (four increasing-thickness bars)
-  gfx->drawRect(2, sy + 3, 28, sh - 6, C_BLACK);
-  for (int i = 0; i < 4; i++) gfx->fillRect(5, sy + 6 + i * 7, 22, i + 1, C_BLACK);
-
-  // pattern swatches: 12 x 2 grid
-  const int gx = 34, gy = sy + 3, pcols = 12, prows = 2;
-  const int pcw = (240 - gx - 3) / pcols, pch = (sh - 6) / prows;
-  for (int r = 0; r < prows; r++)
-    for (int col = 0; col < pcols; col++) {
-      int x = gx + col * pcw, y = gy + r * pch;
-      gfx->drawRect(x, y, pcw, pch, C_BLACK);
-      drawDeskPattern(x + 1, y + 1, pcw - 1, pch - 1, r * pcols + col);
-    }
-}
-
+// Desk screen — a Tend "paper" status card (replaces the old MacPaint window).
+// Header: ember hearth mark + "STATUS" eyebrow (no clock — the screen stays
+// deliberately uncrowded, which also fits Tend's calm ethos). The status word is
+// typed in lowercase ink, centered, with a color-tinted accent rule beneath it.
+// Full redraw on switch-in and on every /desk push (the push goes through
+// drawMeter -> drawDeskSign); only the word region animates in place on the tick.
 void drawDeskSign() {
-  gfx->fillScreen(C_GRAY);        // classic grey desktop behind the window
+  gfx->fillScreen(C_TND_PAPER);
   deskTypingStartMs = millis();
   deskAnimLastMs = 0;
   deskLastShown = "";             // force the first typing frame to paint
 
-  // Menu bar: apple + the MacPaint menu titles.
-  gfx->fillRect(0, 0, 240, 13, C_WHITE);
-  gfx->fillCircle(7, 6, 3, C_BLACK);
-  gfx->fillRect(8, 1, 2, 3, C_BLACK);
+  drawTendFlame(16, 13);
   gfx->setTextSize(1);
-  gfx->setTextColor(C_BLACK, C_WHITE);
-  gfx->setCursor(14, 3);
-  gfx->print("File Edit Goodies Font FontSize Style");
-  gfx->drawFastHLine(0, 13, 240, C_BLACK);
+  gfx->setTextColor(C_TND_MUTE, C_TND_PAPER);
+  gfx->setCursor(30, 8);
+  gfx->print("STATUS");
+  gfx->drawFastHLine(14, 30, 212, C_TND_LINE);
 
-  drawDeskToolPalette();
+  // Accent rule, centered just below where the word will land. Tinted by the
+  // status color (busy=ember, break=marigold, meeting=sky, claude=orange, ...).
+  String label = deskText;
+  label.toLowerCase();
+  if (label.length() > 12) label = label.substring(0, 12);
+  uint8_t sz = deskTextSize(label);
+  int wordBottom = DESK_BODY_Y + (DESK_BODY_H - 8 * sz) / 2 + 8 * sz;
+  const int ruleW = 64;
+  gfx->fillRect((240 - ruleW) / 2, wordBottom + 14, ruleW, 3, deskAccentColor());
 
-  // The "untitled" document window: outline + striped title bar + close box.
-  const int wx = 38, wy = 15, ww = 202, wh = 186;
-  gfx->drawRect(wx, wy, ww, wh, C_BLACK);
-  gfx->fillRect(wx + 1, wy + 1, ww - 2, 12, C_WHITE);
-  for (int s = wy + 3; s <= wy + 11; s += 2) gfx->drawFastHLine(wx + 2, s, ww - 4, C_BLACK);
-  gfx->fillRect(wx + 4, wy + 3, 8, 8, C_WHITE);
-  gfx->drawRect(wx + 4, wy + 3, 8, 8, C_BLACK);
-  const int tw = 8 * 6;                       // "untitled" at size 1
-  const int tx = wx + (ww - tw) / 2;
-  gfx->fillRect(tx - 3, wy + 2, tw + 6, 10, C_WHITE);   // clear stripes behind title
-  gfx->setTextColor(C_BLACK, C_WHITE);
-  gfx->setCursor(tx, wy + 3);
-  gfx->print("untitled");
-  gfx->drawFastHLine(wx, wy + 13, ww, C_BLACK);
-
-  // The white canvas the typed text is drawn into.
-  gfx->fillRect(DESK_CANVAS_X, DESK_CANVAS_Y, DESK_CANVAS_W, DESK_CANVAS_H, C_WHITE);
   drawDeskAnimatedStatus();
-
-  drawDeskPatternStrip();
 }
 
 // ---- Companion face: the Claude "pixel creature", animated frame by frame ------
