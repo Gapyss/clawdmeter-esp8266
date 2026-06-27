@@ -2475,7 +2475,10 @@ static void musicDrawHeader() {
 }
 
 static void musicDrawTime() {
-  gfx->fillRect(0, MUSIC_TIME_Y - 1, 240, 10, C_MUS_PAPER);
+  // Clear only the zones where elapsed/remaining text lands; the wide middle gap
+  // is always paper and never needs clearing (halves the visible flash).
+  gfx->fillRect(MUSIC_PAD, MUSIC_TIME_Y - 1, 60, 10, C_MUS_PAPER);   // elapsed zone
+  gfx->fillRect(164, MUSIC_TIME_Y - 1, 60, 10, C_MUS_PAPER);          // remaining zone
   if (!musicProgressReliable()) return;
   int pos = musicDisplayPos();
   uint16_t tc = C_MUS_INK_MUTED;
@@ -2489,8 +2492,9 @@ static void musicDrawTime() {
 
 static void musicDrawProgress() {
   const int x = MUSIC_PAD, y = MUSIC_PROGRESS_Y, w = 240 - MUSIC_PAD * 2, h = 4;
-  gfx->fillRect(x - 4, y - 4, w + 8, h + 8, C_MUS_PAPER);
-  gfx->fillRoundRect(x, y, w, h, 2, C_MUS_PAPER_DEEP);   // sunken track
+  // No outer fillRect: the full-width track fillRoundRect below overwrites any old
+  // fill, eliminating the paper-flash intermediate step.
+  gfx->fillRoundRect(x, y, w, h, 2, C_MUS_PAPER_DEEP);   // sunken track (clears old fill)
   if (!musicProgressReliable()) return;
   int pos = musicDisplayPos();
   uint16_t fc = musicPausedKnown() ? C_MUS_INK_FAINT : C_MUS_EMBER;
@@ -2500,9 +2504,9 @@ static void musicDrawProgress() {
 
 // Progress + time region only (between the art and the lyric band). The lyric
 // band has its own change-gated repaint and is NOT cleared here.
+// No outer fillRect: musicDrawTime clears its own zones; musicDrawProgress
+// redraws the full-width track without needing a pre-clear.
 static void musicDrawFooter() {
-  gfx->fillRect(0, MUSIC_PROGRESS_Y - 6, 240,
-                (MUSIC_TIME_Y + 10) - (MUSIC_PROGRESS_Y - 6), C_MUS_PAPER);
   musicDrawTime();
   musicDrawProgress();
 }
