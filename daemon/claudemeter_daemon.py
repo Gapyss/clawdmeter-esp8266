@@ -271,6 +271,7 @@ LRCLIB_TIMEOUT = float(os.environ.get("CLAWDMETER_LRCLIB_TIMEOUT", "5"))
 # every NOWPLAYING_TICK seconds.
 LRCLIB_RETRY_BACKOFF = float(os.environ.get("CLAWDMETER_LRCLIB_RETRY_BACKOFF", "300"))
 LYRIC_ADVANCE_SECONDS = float(os.environ.get("CLAWDMETER_LYRIC_ADVANCE_SECONDS", "4.5"))
+LYRIC_SYNC_OFFSET = float(os.environ.get("CLAWDMETER_LYRIC_SYNC_OFFSET", "1.0"))
 MAX_LYRIC_CHARS = int(os.environ.get("CLAWDMETER_MAX_LYRIC_CHARS", "64"))
 LRCLIB_USER_AGENT = os.environ.get(
     "CLAWDMETER_LRCLIB_USER_AGENT",
@@ -821,7 +822,7 @@ def lyric_payload(title, artist, pos, dur, paused, now, state):
     parsed = fetch_lyrics(title, artist, dur)
     synced = parsed.get("synced") or []
     if synced and pos >= 0:
-        lyric, lyric2, next_at, idx = synced_lyric_payload(synced, pos)
+        lyric, lyric2, next_at, idx = synced_lyric_payload(synced, pos + LYRIC_SYNC_OFFSET)
         state["synced_index"] = idx
         return lyric, lyric2, next_at
 
