@@ -897,11 +897,15 @@ static uint16_t barColor(int p) {
   return C_GREEN;
 }
 
+// Status-dot semantics, retuned to the Tend paper palette so the harsh primaries
+// (pure 0x07E0 green / 0xF800 red) don't clash on warm cream: allowed -> quiet
+// moss, at-limit -> Claude orange (brand), rejected/blocked -> loud ember, unknown
+// -> faint. Ember stays reserved for the alert state, per Tend.
 static uint16_t statusColor() {
-  if (unifiedStatus.length() == 0) return C_GRAY;
-  if (unifiedStatus == "allowed") return C_GREEN;
+  if (unifiedStatus.length() == 0) return C_TND_FAINT;
+  if (unifiedStatus == "allowed") return C_TND_MOSS;
   if (sessionPct >= 100 || weeklyPct >= 100) return C_CLAUDE;
-  return C_RED;                         // rejected / blocked / queued ...
+  return C_TND_EMBER;                    // rejected / blocked / queued ...
 }
 
 static void drawClaudeStatusDot(bool force) {
@@ -915,7 +919,7 @@ static void drawClaudeStatusDot(bool force) {
   claudeStatusPulsePhase = phase;
 
   uint16_t c = statusColor();
-  gfx->fillRect(104, 7, 17, 18, C_CREAM);
+  gfx->fillRect(104, 7, 17, 18, C_TND_PAPER);
   if (phase) {
     int r = 4 + phase;
     gfx->drawCircle(112, 16, r, c);
@@ -949,17 +953,19 @@ static void drawProgressBar(int x, int y, int w, int h, int pct) {
   }
 }
 
-// Rounded "pill" usage bar: tan track with a coral fill (red in the danger zone).
+// Rounded "pill" usage bar, Tend palette: sunken paper track with a quiet moss
+// fill that only turns loud ember in the danger zone (>= 85 %) — same moss/ember
+// semantic as the MAC metric rows, so usage reads calm until it's actually high.
 // Repaints the whole track each call so a shrinking % leaves no leftover fill.
 static void drawClaudeBar(int x, int y, int w, int h, int pct) {
   int rad = h / 2;
-  gfx->fillRoundRect(x, y, w, h, rad, C_TAN);     // track (also clears prior fill)
-  gfx->drawRoundRect(x, y, w, h, rad, C_MUTE);    // soft rim for definition
+  gfx->fillRoundRect(x, y, w, h, rad, C_TND_PAPER_DEEP);  // track (also clears prior fill)
+  gfx->drawRoundRect(x, y, w, h, rad, C_TND_LINE);        // soft rim for definition
   if (pct > 0) {
     int p = pct > 100 ? 100 : pct;
     int fw = (w * p) / 100;
     if (fw < h) fw = h;                            // keep the pill renderable at low %
-    uint16_t c = (pct >= 85) ? C_RED : C_CLAUDE;
+    uint16_t c = (pct >= 85) ? C_TND_EMBER : C_TND_MOSS;
     gfx->fillRoundRect(x, y, fw, h, rad, c);
   }
 }
@@ -1032,11 +1038,11 @@ static void printRight(int rightX, int y, uint8_t size, const String &s,
   gfx->print(s);
 }
 
-// Compact IP readout tucked into the bottom-right corner (size-1 gray text).
-// Callers fillScreen(C_BLACK) before this, so no background fill is needed.
+// Compact IP readout tucked into the bottom-right corner of the Claude paper card
+// (size-1 muted text on cream; opaque paper bg so it overprints cleanly).
 static void drawIpPanel() {
-  gfx->fillRect(96, 224, 136, 9, C_CREAM);
-  printRight(232, 224, 1, "IP " + WiFi.localIP().toString(), C_MUTE, C_CREAM);
+  gfx->fillRect(96, 224, 136, 9, C_TND_PAPER);
+  printRight(232, 224, 1, "IP " + WiFi.localIP().toString(), C_TND_MUTE, C_TND_PAPER);
 }
 
 static void drawMetricRow(int y, const char *label, int pct, int barX, int barW) {
@@ -1230,71 +1236,70 @@ static void drawDeskAnimatedStatus() {
   drawDeskStatusText(label);
 }
 
-// Static chrome for the cream "claude.ai" card. Drawn once on switch-in (gated by
+// Static chrome for the Tend warm-paper "claude.ai" card. Drawn once on switch-in (gated by
 // claudeChromeReady); the per-push dynamic pass repaints only the values in-place,
 // so there is no fillScreen flash every 60 s (same discipline as the MAC screen).
 static void drawClaudeChrome() {
-  // Soft rounded card edge (2 px) on the cream field.
-  gfx->drawRoundRect(2, 2, 236, 236, 12, C_MUTE);
-  gfx->drawRoundRect(3, 3, 234, 234, 11, C_MUTE);
-
-  // Header: Claude burst mark + wordmark, then a hairline divider rule.
+  // No card border — the clean warm-paper field matches the MAC / desk / music
+  // Tend cards. Header: the kept Claude burst mark (brand orange) + wordmark,
+  // then a hairline Tend divider rule.
   drawClaudeIcon(16, 16, C_CLAUDE);
   gfx->setTextSize(2);
-  gfx->setTextColor(C_INK, C_CREAM);
+  gfx->setTextColor(C_TND_INK, C_TND_PAPER);
   gfx->setCursor(32, 9);
   gfx->print("Claude");
-  gfx->drawFastHLine(12, 33, 216, C_TAN);
+  gfx->drawFastHLine(12, 33, 216, C_TND_LINE);
 
-  // Static block labels (the values themselves are painted by the dynamic pass).
+  // Static block labels in Tend's calm lowercase voice (values painted dynamically).
   gfx->setTextSize(1);
-  gfx->setTextColor(C_MUTE, C_CREAM);
+  gfx->setTextColor(C_TND_MUTE, C_TND_PAPER);
   gfx->setCursor(20, 46);
-  gfx->print("Session 5h");
+  gfx->print("session 5h");
 
   gfx->setTextSize(2);
-  gfx->setTextColor(C_INK, C_CREAM);
+  gfx->setTextColor(C_TND_INK, C_TND_PAPER);
   gfx->setCursor(20, 158);
-  gfx->print("Weekly");
+  gfx->print("weekly");
 }
 
 // Dynamic session block: binding accent, headline %, pill bar, reset + countdown.
 static void drawClaudeHero() {
-  // Binding-limit accent: a coral tick beside the active block's label.
-  gfx->fillRect(12, 45, 3, 9, bindingLimit == 1 ? C_CLAUDE : C_CREAM);
+  // Binding-limit accent: a Claude-orange tick beside the active block's label
+  // (kept brand orange — a small accent, the one place besides the logo).
+  gfx->fillRect(12, 45, 3, 9, bindingLimit == 1 ? C_CLAUDE : C_TND_PAPER);
 
-  // Headline percentage in dark ink (coral is reserved for accents); red in danger.
-  uint16_t bigC = (sessionPct >= 85) ? C_RED : C_INK;
-  gfx->fillRect(8, 60, 224, 38, C_CREAM);              // clear band (width changes)
-  printCentered(63, 5, pctText(sessionPct), bigC, C_CREAM);
+  // Headline percentage in deep ink; ember only in the danger zone (>= 85 %).
+  uint16_t bigC = (sessionPct >= 85) ? C_TND_EMBER : C_TND_INK;
+  gfx->fillRect(8, 60, 224, 38, C_TND_PAPER);          // clear band (width changes)
+  printCentered(63, 5, pctText(sessionPct), bigC, C_TND_PAPER);
 
   drawClaudeBar(16, 110, 208, 16, sessionPct);
 
   // Reset time (fixed width) + live countdown (variable width → cleared).
   gfx->setTextSize(1);
-  gfx->setTextColor(C_MUTE, C_CREAM);
+  gfx->setTextColor(C_TND_MUTE, C_TND_PAPER);
   gfx->setCursor(20, 136);
   if (sessReset == 0) gfx->print("reset --:--");
   else gfx->print("reset " + hhmm(sessReset + TZ_OFFSET));
 
   String cd = (sessReset && nowEpoch()) ? countdown((long)sessReset - (long)nowEpoch()) : "T--";
-  gfx->fillRect(176, 136, 48, 8, C_CREAM);
-  printRight(224, 136, 1, cd, C_INK, C_CREAM);
+  gfx->fillRect(176, 136, 48, 8, C_TND_PAPER);
+  printRight(224, 136, 1, cd, C_TND_INK, C_TND_PAPER);
 }
 
 // Dynamic weekly block: binding accent, %, pill bar, reset day/time.
 static void drawClaudeWeekly() {
-  gfx->fillRect(12, 160, 3, 11, bindingLimit == 2 ? C_CLAUDE : C_CREAM);
+  gfx->fillRect(12, 160, 3, 11, bindingLimit == 2 ? C_CLAUDE : C_TND_PAPER);
 
-  uint16_t wC = (weeklyPct >= 85) ? C_RED : C_INK;
-  gfx->fillRect(150, 158, 74, 14, C_CREAM);           // clear region (width changes)
-  printRight(224, 158, 2, pctText(weeklyPct), wC, C_CREAM);
+  uint16_t wC = (weeklyPct >= 85) ? C_TND_EMBER : C_TND_INK;
+  gfx->fillRect(150, 158, 74, 14, C_TND_PAPER);       // clear region (width changes)
+  printRight(224, 158, 2, pctText(weeklyPct), wC, C_TND_PAPER);
 
   drawClaudeBar(16, 182, 208, 12, weeklyPct);
 
-  gfx->fillRect(20, 202, 176, 8, C_CREAM);
+  gfx->fillRect(20, 202, 176, 8, C_TND_PAPER);
   gfx->setTextSize(1);
-  gfx->setTextColor(C_MUTE, C_CREAM);
+  gfx->setTextColor(C_TND_MUTE, C_TND_PAPER);
   gfx->setCursor(20, 202);
   if (weekReset == 0) gfx->print("reset --");
   else gfx->print("reset " + dowName(weekReset + TZ_OFFSET) + " " + hhmm(weekReset + TZ_OFFSET));
@@ -1316,13 +1321,13 @@ void tickDynamic() {
     return;
   }
 
-  // SCREEN_CLAUDE: cream header clock + session countdown, opaque cream-bg prints.
-  gfx->fillRect(184, 12, 48, 8, C_CREAM);
-  printRight(232, 12, 1, hhmmss(e + TZ_OFFSET), C_INK, C_CREAM);
+  // SCREEN_CLAUDE: paper header clock + session countdown, opaque paper-bg prints.
+  gfx->fillRect(184, 12, 48, 8, C_TND_PAPER);
+  printRight(232, 12, 1, hhmmss(e + TZ_OFFSET), C_TND_INK, C_TND_PAPER);
 
   if (sessReset) {
-    gfx->fillRect(176, 136, 48, 8, C_CREAM);
-    printRight(224, 136, 1, countdown((long)sessReset - (long)e), C_INK, C_CREAM);
+    gfx->fillRect(176, 136, 48, 8, C_TND_PAPER);
+    printRight(224, 136, 1, countdown((long)sessReset - (long)e), C_TND_INK, C_TND_PAPER);
   }
 }
 
@@ -2702,32 +2707,32 @@ void drawMeter() {
   if (lcdScreen == SCREEN_FACE) { faceBegin(); return; }
   if (lcdScreen == SCREEN_MUSIC) { drawMusic(); return; }
 
-  // Two-phase repaint: draw the cream card chrome once on switch-in, then only
-  // repaint values on every /usage push (no fillScreen flash). The no-data case
-  // (Claude down) renders the same card with "--" placeholders, not a black screen.
+  // Two-phase repaint: draw the Tend paper card chrome once on switch-in, then
+  // only repaint values on every /usage push (no fillScreen flash). The no-data
+  // case (Claude down) renders the same card with "--" placeholders, not a blank.
   if (!claudeChromeReady) {
-    gfx->fillScreen(C_CREAM);
+    gfx->fillScreen(C_TND_PAPER);
     drawClaudeChrome();
     claudeChromeReady = true;
   }
 
-  // Header status: API state word + pulsing dot, then the Thailand-time clock.
+  // Header status (kept): API state word + pulsing dot, then the Thailand clock.
   if (unifiedStatus.length()) {
     uint16_t c = statusColor();
     drawClaudeStatusDot(true);
     String label = unifiedStatus;
     label.toUpperCase();
     if (label.length() > 8) label = label.substring(0, 8);
-    gfx->fillRect(122, 12, 56, 8, C_CREAM);
+    gfx->fillRect(122, 12, 56, 8, C_TND_PAPER);
     gfx->setTextSize(1);
-    gfx->setTextColor(c, C_CREAM);
+    gfx->setTextColor(c, C_TND_PAPER);
     gfx->setCursor(124, 12);
     gfx->print(label);
   }
   unsigned long e = nowEpoch();
-  gfx->fillRect(184, 12, 48, 8, C_CREAM);
+  gfx->fillRect(184, 12, 48, 8, C_TND_PAPER);
   printRight(232, 12, 1, e ? hhmmss(e + TZ_OFFSET) : String("--:--:--"),
-             C_INK, C_CREAM);
+             C_TND_INK, C_TND_PAPER);
 
   drawClaudeHero();
   drawClaudeWeekly();
