@@ -68,7 +68,7 @@ arduino-cli compile --fqbn esp8266:esp8266:nodemcuv2:mmu=4816 --output-dir firmw
 > to lock it, change `httpUpdater.setup(&server);` to
 > `httpUpdater.setup(&server, "admin", "yourpassword");` and re-flash.
 
-## 2. Run the daemon (Mac)
+## 2. Run the daemon (Mac or Windows)
 
 ```sh
 python3 daemon/claudemeter_daemon.py
@@ -76,20 +76,27 @@ python3 daemon/claudemeter_daemon.py
 
 - First run, macOS may pop a Keychain prompt for the `Claude Code-credentials`
   item — click **Always Allow**.
-- It prints Claude usage plus Mac CPU/memory each minute; the dashboard updates
+- It prints Claude usage plus system CPU/memory each minute; the dashboard updates
   within ~3s.
 - If you see `401 Unauthorized`, your Claude Code login expired — run any
   `claude` command to refresh it, then restart the daemon. While Claude usage is
-  unavailable, the daemon still pushes Mac CPU/memory/disk/battery metrics so the
-  Mac screen keeps updating.
+  unavailable, the daemon still pushes CPU/memory/disk/battery metrics so the
+  device's MAC screen keeps updating.
 - Device pushes default to a 5 second timeout and 3 attempts, which helps when the
   ESP8266 is still settling after a reboot. Override with
   `CLAWDMETER_DEVICE_TIMEOUT` or `CLAWDMETER_DEVICE_PUSH_ATTEMPTS` if your WiFi is
   unusually slow.
 - YouTube Music duration metadata uses `yt-dlp`:
-  `python3 -m pip install --user yt-dlp`. To show live remaining time instead of
-  just duration, enable Chrome's **View > Developer > Allow JavaScript from Apple
-  Events** so the daemon can read the tab's `<video>` current position.
+  `python3 -m pip install --user yt-dlp`. On macOS, to show live remaining time
+  instead of just duration, enable Chrome's **View > Developer > Allow JavaScript
+  from Apple Events** so the daemon can read the tab's progress bar.
+
+**On Windows:** the daemon runs the same way (`python3 daemon\claudemeter_daemon.py`),
+no Keychain prompt needed — it reads `%USERPROFILE%\.claude\.credentials.json`
+directly. Now-playing (YouTube Music title/artist/position from a Chrome tab) needs
+one extra optional package: `python3 -m pip install winsdk`. Without it, everything
+else (usage, CPU/memory/disk/battery, desk status, dashboard) still works; only
+now-playing stays empty and the daemon prints one warning about the missing package.
 
 The daemon targets `http://clawdmeter.local` by default (macOS resolves `.local`
 natively). If it can't resolve, set `CLAWDMETER_DEVICE_URL` to the device's IP
