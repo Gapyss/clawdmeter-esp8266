@@ -39,6 +39,17 @@ reset metadata, and simple Mac system metrics.
   Claude/API failures are not allowed to block Mac metrics: the daemon falls back
   to a best-effort `/usage` push with unavailable usage fields plus live
   CPU/memory/disk/battery values, and tags `stat` with a `claude_*` reason.
+- **The daemon also runs on Windows**, gated by `IS_WINDOWS = sys.platform.startswith("win")`
+  in `claudemeter_daemon.py`. Windows has no Keychain here, so `get_token()` instead
+  reads the plaintext `%USERPROFILE%\.claude\.credentials.json` file Claude Code
+  itself writes there (or `%CLAUDE_CONFIG_DIR%\.credentials.json` if that env var is
+  set) — same JSON shape, same recursive `accessToken` search
+  (`_find_access_token`). CPU/memory/battery use `ctypes` calls to kernel32
+  (`GetSystemTimes`, `GlobalMemoryStatusEx`, `GetSystemPowerStatus`) since there's
+  no Windows equivalent of `ps`/`vm_stat`/`pmset` and the project deliberately
+  avoids adding `psutil` as a dependency. Now-playing uses the optional `winsdk`
+  package to read Windows' System Media Transport Controls (SMTC) instead of
+  AppleScript — see the now-playing note below.
 - **Device transport is HTTP query args, not JSON.** The daemon pushes
   `POST /usage?s=<int>&w=<int>...` so the firmware needs no JSON parser. Keep it
   this way unless you add ArduinoJson for a reason.
@@ -171,10 +182,18 @@ redrawn by `drawDeskSign` on switch-in and on every `/desk` push (the push runs 
 into that tick path. No clock on this screen — it stays deliberately uncrowded, matching Tend's
 calm ethos (device remains reachable at `clawdmeter.local`) ·
 `GET|POST /nowplaying?title=&artist=&pos=&dur=&paused=&lyric=&lyric2=&lyric3=&lt=&lt2=` pushes the
-**YouTube Music now-playing** song (the daemon reads it from the Chrome tab's `navigator.mediaSession`
-metadata via AppleScript, falling back to the tab *title* when page JS is blocked — the bare tab
-title often stays "YouTube Music" when a song is played from the home feed, so MediaSession is
-preferred; values are URL-encoded UTF-8 — Thai is preserved, not ASCII-stripped). `lyric`, `lyric2`, and `lyric3`
+**YouTube Music now-playing** song. On macOS the daemon reads it from the Chrome tab's
+`navigator.mediaSession` metadata via AppleScript, falling back to the tab *title* when page JS is
+blocked — the bare tab title often stays "YouTube Music" when a song is played from the home feed,
+so MediaSession is preferred. On Windows there's no AppleScript, so `_read_now_playing_windows()`
+instead reads Windows' System Media Transport Controls (SMTC) via the optional `winsdk` package
+(`pip install winsdk`) — Chrome itself mirrors the page's `navigator.mediaSession` metadata into
+SMTC, so this is the OS doing the same job AppleScript+JS-injection does on macOS, restricted to a
+Chrome-sourced session (`source_app_user_model_id` contains "chrome") since SMTC has no concept of
+tab URL to filter by. If `winsdk` isn't installed, now-playing is silently disabled on Windows (one
+stderr warning) while everything else in the daemon keeps working. Both platforms feed the same
+`read_now_playing()` → yt-dlp-augmentation → `push_now_playing()` pipeline (values are URL-encoded
+UTF-8 — Thai is preserved, not ASCII-stripped). `lyric`, `lyric2`, and `lyric3`
 are the current/upcoming/look-ahead lyric lines from lrclib.net; `lt` and `lt2` are the next two
 line playback positions in seconds, or `-1` when the daemon is driving plain-lyric fallback timing.
 **Now-playing is a web-only
@@ -324,6 +343,12 @@ already cached under a romanized-artist or remaster variant.
   restarts. Only real results are stored; "none found" stays session-only so a song
   missing today can be picked up later. This is the no-download alternative to the
   full `CLAWDMETER_LRCLIB_DB` dump and coexists with it.
+  `CLAWDMETER_WINSDK_CHROME_HINT` (Windows only, default `chrome`): the
+  case-insensitive substring matched against each SMTC session's
+  `source_app_user_model_id` to find the Chrome-sourced one. Chrome is a classic
+  desktop app so this ID isn't a predictable UWP-style AUMID; if now-playing stays
+  empty on a real Windows box, check stderr for the "no session matched hint" log
+  (printed once, listing the AUMIDs SMTC actually reported) and set this to match.
 - The compiled `.bin` is built for `nodemcuv2` (4 MB flash) with the `mmu=4816`
   and `ip=hb2f` options. A 1 MB board (e.g. ESP-01) needs a different FQBN/flash
   layout for OTA. Don't drop `ip=hb2f` — it's what makes the 15 KB dashboard load

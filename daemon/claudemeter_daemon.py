@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Clawdmeter daemon (macOS).
+"""Clawdmeter daemon (macOS or Windows).
 
 Pushes two usage percentages to an ESP8266 web dashboard over HTTP.
 
@@ -8,7 +8,12 @@ Claude's real server-side usage limits. Set CLAWDMETER_USAGE_SOURCE=local to use
 Claude Code's local JSONL transcripts instead.
 
 Runs on system Python 3. YouTube Music duration metadata uses optional yt-dlp.
+On Windows, now-playing additionally needs the optional `winsdk` package (reads
+title/artist/position/duration/playback-status from the OS System Media
+Transport Controls instead of macOS's AppleScript+Chrome).
 """
+import asyncio
+import ctypes
 import difflib
 import json
 import os
@@ -25,6 +30,8 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+
+IS_WINDOWS = sys.platform.startswith("win")
 
 # ---- Edit if needed ----
 DEVICE_URL = os.environ.get("CLAWDMETER_DEVICE_URL", "http://clawdmeter.local")
@@ -101,16 +108,7 @@ def turn_tokens(record):
     return ts, tokens, msg.get("id") or ""
 
 
-def get_token():
-    """Read the Claude Code OAuth access token from the macOS Keychain."""
-    out = subprocess.check_output(
-        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
-        text=True,
-    ).strip()
-    try:
-        data = json.loads(out)
-    except json.JSONDecodeError:
-        return out
+def _find_access_token(data):
     stack = [data]
     while stack:
         node = stack.pop()
@@ -121,7 +119,31 @@ def get_token():
             stack.extend(node.values())
         elif isinstance(node, list):
             stack.extend(node)
-    raise RuntimeError("accessToken not found in Keychain item")
+    raise RuntimeError("accessToken not found in credentials")
+
+
+def get_token():
+    """Read the Claude Code OAuth access token.
+
+    macOS: from the encrypted Keychain item `Claude Code-credentials`.
+    Windows: Claude Code has no Keychain there, so it writes the same payload to
+    a plain `.credentials.json` file under %USERPROFILE%\\.claude (or
+    CLAUDE_CONFIG_DIR, if set) instead.
+    """
+    if IS_WINDOWS:
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+        creds_path = Path(config_dir) / ".credentials.json"
+        data = json.loads(creds_path.read_text(encoding="utf-8"))
+        return _find_access_token(data)
+    out = subprocess.check_output(
+        ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+        text=True,
+    ).strip()
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return out
+    return _find_access_token(data)
 
 
 def pct(value):
@@ -195,7 +217,90 @@ def bounded_pct(value):
         return -1
 
 
+# ---- Windows system metrics (ctypes, no extra dependency) ----
+# macOS reads these by shelling out to `ps`/`vm_stat`/`pmset`, which don't exist on
+# Windows. There's no single command-line equivalent either, so these call the
+# same kernel32 APIs psutil itself wraps, directly via ctypes.
+
+
+class _WinFiletime(ctypes.Structure):
+    _fields_ = [("dwLowDateTime", ctypes.c_ulong), ("dwHighDateTime", ctypes.c_ulong)]
+
+
+def _win_filetime_to_int(ft):
+    return (ft.dwHighDateTime << 32) | ft.dwLowDateTime
+
+
+def _win_system_times():
+    idle, kernel, user = _WinFiletime(), _WinFiletime(), _WinFiletime()
+    ok = ctypes.windll.kernel32.GetSystemTimes(
+        ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+    )
+    if not ok:
+        return None
+    return (_win_filetime_to_int(idle), _win_filetime_to_int(kernel), _win_filetime_to_int(user))
+
+
+def _win_cpu_percent(sample_seconds=0.2):
+    first = _win_system_times()
+    if first is None:
+        return -1
+    time.sleep(sample_seconds)
+    second = _win_system_times()
+    if second is None:
+        return -1
+    idle_delta = second[0] - first[0]
+    # Windows' "kernel" time already includes idle time, so total = kernel + user.
+    total_delta = (second[1] + second[2]) - (first[1] + first[2])
+    if total_delta <= 0:
+        return -1
+    return bounded_pct((total_delta - idle_delta) * 100 / total_delta)
+
+
+class _WinMemoryStatusEx(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def _win_memory_percent():
+    stat = _WinMemoryStatusEx()
+    stat.dwLength = ctypes.sizeof(_WinMemoryStatusEx)
+    if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+        return -1
+    return bounded_pct(stat.dwMemoryLoad)  # already a 0..100 percent
+
+
+class _WinSystemPowerStatus(ctypes.Structure):
+    _fields_ = [
+        ("ACLineStatus", ctypes.c_ubyte),
+        ("BatteryFlag", ctypes.c_ubyte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("SystemStatusFlag", ctypes.c_ubyte),
+        ("BatteryLifeTime", ctypes.c_ulong),
+        ("BatteryFullLifeTime", ctypes.c_ulong),
+    ]
+
+
+def _win_battery_percent():
+    status = _WinSystemPowerStatus()
+    if not ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+        return -1
+    pct = status.BatteryLifePercent
+    return -1 if pct == 255 else bounded_pct(pct)  # 255 = unknown (e.g. no battery)
+
+
 def cpu_percent():
+    if IS_WINDOWS:
+        return _win_cpu_percent()
     out = run_text(["ps", "-A", "-o", "%cpu="])
     total = 0.0
     for line in out.splitlines():
@@ -208,6 +313,8 @@ def cpu_percent():
 
 
 def memory_percent():
+    if IS_WINDOWS:
+        return _win_memory_percent()
     vm = run_text(["vm_stat"])
 
     pages = {}
@@ -237,12 +344,16 @@ def disk_percent():
 
 
 def battery_percent():
+    if IS_WINDOWS:
+        return _win_battery_percent()
     out = run_text(["pmset", "-g", "batt"])
     m = re.search(r"(\d+)%", out)
     return bounded_pct(m.group(1)) if m else -1
 
 
 def mac_metrics():
+    """Host system metrics for the device's MAC screen (named for the screen, not
+    the host OS -- this runs the same on Windows)."""
     return {
         "cpu": cpu_percent(),
         "mem": memory_percent(),
@@ -270,6 +381,14 @@ def mac_metrics():
 NOWPLAYING_SUFFIXES = (" - YouTube Music", " | YouTube Music")
 YTDLP_CACHE = {}
 YTDLP_WARNED = False
+WINSDK_WARNED = False
+# Chrome is a classic desktop app, not a packaged UWP app, so Windows doesn't give it
+# a predictable AUMID (Application User Model ID) the way it does for Store apps --
+# it could be an exe path, "chrome.exe", or something install-specific. "chrome" is
+# the common case; override if a real device logs a different source_app_user_model_id
+# (see the diagnostic print in _win_read_now_playing_async).
+WINSDK_CHROME_HINT = os.environ.get("CLAWDMETER_WINSDK_CHROME_HINT", "chrome").lower()
+WINSDK_AUMID_LOGGED = False
 LRCLIB_CACHE = {}
 LRCLIB_FAIL = {}          # key -> monotonic time of last network failure (negative cache)
 LRCLIB_WARNED = False
@@ -408,17 +527,15 @@ def ytdlp_metadata(url, title="", artist=""):
     return meta
 
 
-def read_now_playing():
-    """Return (title, artist, pos, dur, paused) for YouTube Music, else empty.
-
-    YT Music's tab title varies. It may be "Song - Artist - YouTube Music",
-    or just "Song | YouTube Music", so parse defensively rather than with a
-    strict pattern. yt-dlp augments the title-derived metadata with canonical
-    duration; browser JS supplies current position when Chrome allows it.
+def _read_now_playing_macos():
+    """Return (title, artist, url, pos, dur, paused) read from a Chrome tab via
+    AppleScript. YT Music's tab title varies -- it may be "Song - Artist -
+    YouTube Music", or just "Song | YouTube Music" -- so parse defensively
+    rather than with a strict pattern.
     """
     raw = run_text(["osascript", "-e", NOWPLAYING_SCRIPT], timeout=4).strip()
     if not raw:
-        return ("", "", -1, -1, -1)
+        return ("", "", "", -1, -1, -1)
 
     parts = raw.splitlines()
     title, artist = parse_nowplaying_title(parts[0] if parts else "")
@@ -440,17 +557,114 @@ def read_now_playing():
     if media_title:
         title = media_title
         artist = media_artist or artist
-    meta = ytdlp_metadata(url, title, artist)
+    return (title, artist, url, pos, browser_dur, paused)
 
+
+async def _win_read_now_playing_async():
+    """winsdk coroutine: pick a Chrome-sourced SMTC session and read its state."""
+    global WINSDK_AUMID_LOGGED
+    from winsdk.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus as PlaybackStatus,
+    )
+
+    manager = await MediaManager.request_async()
+    sessions = list(manager.get_sessions())
+    session = None
+    for candidate in sessions:
+        aumid = (candidate.source_app_user_model_id or "").lower()
+        if WINSDK_CHROME_HINT not in aumid:
+            continue
+        session = candidate
+        if candidate.get_playback_info().playback_status == PlaybackStatus.PLAYING:
+            break  # prefer an actively-playing Chrome tab over a merely-open one
+
+    if session is None:
+        # Silent "nothing playing" here is indistinguishable from "the AUMID match
+        # is wrong for this Chrome install" -- log what SMTC actually reported once,
+        # so a real device is self-diagnosable instead of just looking idle forever.
+        if sessions and not WINSDK_AUMID_LOGGED:
+            seen = ", ".join(repr(s.source_app_user_model_id) for s in sessions)
+            print(f"now-playing: no session matched hint {WINSDK_CHROME_HINT!r}; "
+                  f"seen source_app_user_model_id values: {seen} -- override with "
+                  "CLAWDMETER_WINSDK_CHROME_HINT if Chrome's doesn't contain 'chrome'",
+                  file=sys.stderr)
+            WINSDK_AUMID_LOGGED = True
+        return ("", "", -1, -1, -1)
+
+    props = await session.try_get_media_properties_async()
+    title = (props.title or "").strip()
+    if not title:
+        return ("", "", -1, -1, -1)
+    artist = (props.artist or "").strip()
+
+    status = session.get_playback_info().playback_status
+    if status == PlaybackStatus.PLAYING:
+        paused = 0
+    elif status == PlaybackStatus.PAUSED:
+        paused = 1
+    else:
+        paused = -1
+
+    # end_time is the track length assuming start_time is 0, which holds for YT
+    # Music in Chrome (no mid-timeline seek-window trimming like some podcast apps).
+    timeline = session.get_timeline_properties()
+    pos = int(timeline.position.total_seconds())
+    dur = int(timeline.end_time.total_seconds())
+    return (title, artist, pos if pos >= 0 else -1, dur if dur > 0 else -1, paused)
+
+
+def _read_now_playing_windows():
+    """Return (title, artist, url, pos, dur, paused) via Windows' System Media
+    Transport Controls, restricted to a Chrome-sourced session. Chrome mirrors the
+    page's navigator.mediaSession metadata (the same title/artist YT Music sets)
+    into SMTC, so this needs no AppleScript-style JS injection into the tab — the
+    OS is already doing that job. Requires the optional `winsdk` package; SMTC
+    exposes no tab URL, so url is always "".
+    """
+    global WINSDK_WARNED
+    try:
+        import winsdk  # noqa: F401  (presence check; actual use is in the async helper)
+    except ImportError:
+        if not WINSDK_WARNED:
+            print("now-playing disabled on Windows: install with "
+                  "`python3 -m pip install winsdk`", file=sys.stderr)
+            WINSDK_WARNED = True
+        return ("", "", "", -1, -1, -1)
+    try:
+        title, artist, pos, dur, paused = asyncio.run(_win_read_now_playing_async())
+    except Exception as e:
+        print(f"windows now-playing read failed: {e}", file=sys.stderr)
+        return ("", "", "", -1, -1, -1)
+    return (title, artist, "", pos, dur, paused)
+
+
+def read_now_playing():
+    """Return (title, artist, pos, dur, paused) for YouTube Music, else empty.
+
+    Reads via AppleScript+Chrome on macOS or SMTC on Windows (see
+    _read_now_playing_macos / _read_now_playing_windows). yt-dlp then augments
+    the title-derived metadata with canonical duration where the OS/browser
+    didn't already supply live position/duration.
+    """
+    if IS_WINDOWS:
+        title, artist, url, pos, browser_dur, paused = _read_now_playing_windows()
+    else:
+        title, artist, url, pos, browser_dur, paused = _read_now_playing_macos()
+    if not title and not url:
+        return ("", "", -1, -1, -1)
+
+    meta = ytdlp_metadata(url, title, artist)
     if meta.get("title") and not meta.get("search"):
         title = meta["title"]
     if meta.get("artist") and not artist and not meta.get("search"):
         artist = meta["artist"]
-    # YT Music's player progress bar (read in NOWPLAYING_SCRIPT) is authoritative for
-    # the currently loaded track's duration. yt-dlp is only a fallback: URL/search
-    # metadata can lag or resolve the wrong version during YouTube Music auto-advance.
-    # (The raw <video> element is deliberately NOT used for duration — see the
-    # NOWPLAYING_SCRIPT note: it reports the cumulative autoplay-queue timeline.)
+    # The OS/browser-reported duration (progress bar on macOS, SMTC timeline on
+    # Windows) is authoritative for the currently loaded track. yt-dlp is only a
+    # fallback: URL/search metadata can lag or resolve the wrong version during
+    # YouTube Music auto-advance. (The raw <video> element is deliberately NOT used
+    # for duration on macOS — see the NOWPLAYING_SCRIPT note: it reports the
+    # cumulative autoplay-queue timeline.)
     dur = browser_dur if browser_dur > 0 else (meta.get("duration") or -1)
     return (title, artist, pos, dur, paused)
 
