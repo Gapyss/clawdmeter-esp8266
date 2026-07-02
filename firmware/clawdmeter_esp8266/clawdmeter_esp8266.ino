@@ -822,9 +822,15 @@ void handleRestart() {
 
 void handleFactoryReset() {
   WiFiManager wm;
-  wm.resetSettings();
   EEPROM.write(EEPROM_MARKER_ADDR, 0x00);
   EEPROM.write(EEPROM_BRIGHTNESS_ADDR, LCD_BRIGHTNESS);
+  // Silence the PWM ISR before ANY flash write: resetSettings() erases the SDK
+  // WiFi-config sector and EEPROM.commit() writes the marker. A PWM timer
+  // interrupt mid-erase resets the ESP8266 (this repo's signature failure) and
+  // could leave the wipe half-done — creds surviving a "factory reset". Detaching
+  // the pin leaves the backlight steady-on; we reboot right after so no restore.
+  backlightStopForFlash();
+  wm.resetSettings();
   EEPROM.commit();
 
   server.sendHeader("Connection", "close");
@@ -2855,6 +2861,12 @@ void setup() {
   WiFiManager wm;
   wm.setConfigPortalTimeout(180);          // give up after 3 min and reboot/retry
   wm.setAPCallback([](WiFiManager *m) {    // show setup hint on the screen
+    // Submitting WiFi in the portal makes the SDK persist creds to flash from
+    // INSIDE autoConnect() (WiFi.persistent defaults true) — a flash write we
+    // can't wrap directly. Detaching the PWM waveform for the whole portal
+    // window removes the ISR that would reset the board mid-write; the panel
+    // just runs steady-on (no dimming) until we restore it after autoConnect.
+    backlightStopForFlash();
     gfx->fillScreen(0x0000);
     gfx->setTextColor(0xFFFF, 0x0000);
     gfx->setTextSize(2);
@@ -2867,6 +2879,9 @@ void setup() {
     Serial.println("WiFi setup timed out, restarting...");
     ESP.restart();
   }
+  // Portal is done (creds saved, no more flash writes) — restore live PWM dimming
+  // in case the setAPCallback fired and detached the waveform to steady-on.
+  setBacklight(lcdBrightness);
   Serial.print("Connected: http://");
   Serial.println(WiFi.localIP());
 
