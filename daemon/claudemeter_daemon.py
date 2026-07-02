@@ -632,7 +632,13 @@ def _read_now_playing_windows():
             WINSDK_WARNED = True
         return ("", "", "", -1, -1, -1)
     try:
-        title, artist, pos, dur, paused = asyncio.run(_win_read_now_playing_async())
+        # Bound the SMTC read like every other blocking call here (the macOS path
+        # caps osascript at timeout=4). main() is single-threaded, so an unbounded
+        # await on a stalled WinRT/COM call would freeze the whole daemon --
+        # including Claude usage polling and device pushes -- not just now-playing.
+        title, artist, pos, dur, paused = asyncio.run(
+            asyncio.wait_for(_win_read_now_playing_async(), timeout=4)
+        )
     except Exception as e:
         print(f"windows now-playing read failed: {e}", file=sys.stderr)
         return ("", "", "", -1, -1, -1)
