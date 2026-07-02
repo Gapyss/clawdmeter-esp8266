@@ -677,6 +677,28 @@ def _norm_match_text(s):
     return re.sub(r"\s+", " ", s).strip()
 
 
+# Cosmetic title suffixes that mark the SAME recording but vary between YT Music
+# contexts and lrclib: remasters and version tags. Stripped only for tolerant
+# *matching* — never for cache keys. (Live)/(Acoustic)/(Demo) are deliberately
+# NOT here: those are different recordings with different lyrics/timing.
+_TITLE_NOISE_RE = re.compile(
+    r"\s*[\(\[]\s*[^)\]]*\b(?:remaster(?:ed)?|original\s+version|mono|stereo|"
+    r"album\s+version|single\s+version)\b[^)\]]*[\)\]]"
+    r"|\s*-\s*(?:\d{2,4}\s+)?(?:remaster(?:ed)?|original\s+version|mono|stereo)\b.*$",
+    re.IGNORECASE,
+)
+
+
+def _canonical_title(s):
+    """Lowercased title with feat./remaster/version noise removed, for tolerant
+    matching across YT Music's cosmetic title variants. NOT used for cache keys."""
+    s = (s or "").strip().lower()
+    s = _FEAT_RE.sub(" ", s)
+    s = _TITLE_NOISE_RE.sub(" ", s)
+    s = _MATCH_PUNCT_RE.sub(" ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def _fuzzy_ratio(a, b):
     return difflib.SequenceMatcher(None, a, b).ratio() if a and b else 0.0
 
@@ -794,6 +816,54 @@ def lyric_cache_put(key, payload):
         print(f"lyric cache write failed ({e})", file=sys.stderr)
 
 
+def tolerant_cache_lookup(title, dur):
+    """Artist-blind, title-canonical, duration±2s scan of the persistent cache.
+
+    Rescues the SAME recording when YT Music reports it with a cosmetic title
+    suffix (e.g. "(Remastered 2015)") or a different-script artist than the cached
+    copy (e.g. Thai "บอย โกสิยพงษ์" vs romanized "Boyd Kosiyabong"). The duration
+    gate is a HARD ±2s so two same-title covers (Beatles vs John Denver "Let It Be")
+    can never collide. Returns (parsed, raw_payload) or None — a full-table scan over
+    the tiny cache is microseconds.
+    """
+    conn = lyric_cache_db()
+    if conn is None or not dur or dur <= 0:
+        return None
+    want = _canonical_title(title)
+    if not want:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT key, synced_lyrics, plain_lyrics, instrumental FROM lyrics_cache"
+        ).fetchall()
+    except sqlite3.Error:
+        return None
+    best = None
+    best_delta = 3  # only |delta| <= 2 qualifies
+    for key, synced, plain, instrumental in rows:
+        parts = key.split("\x1f")
+        if len(parts) != 3:
+            continue
+        cand_title, _cand_artist, cand_dur = parts
+        try:
+            cand_dur = int(cand_dur)
+        except ValueError:
+            continue
+        if _canonical_title(cand_title) != want:
+            continue
+        delta = abs(cand_dur - int(dur))
+        if delta < best_delta:
+            best_delta = delta
+            best = (synced, plain, instrumental)
+            if delta == 0:
+                break
+    if best is None:
+        return None
+    payload = {"syncedLyrics": best[0] or "", "plainLyrics": best[1] or "",
+               "instrumental": bool(best[2])}
+    return lyrics_from_lrclib_payload(payload), payload
+
+
 def fetch_lyrics(title, artist, dur):
     """Return cached parsed lyrics for the current song, fetching from lrclib if needed."""
     global LRCLIB_WARNED
@@ -806,6 +876,16 @@ def fetch_lyrics(title, artist, dur):
     if cached is not None:
         LRCLIB_CACHE[key] = cached
         return cached
+    # Tolerant local rescue: the same recording may already be cached under a
+    # cosmetic title variant or a different-script artist. ±2s-gated, so safe to
+    # write through under the live key — next lookup is then an exact O(1) hit.
+    local = tolerant_cache_lookup(title, dur)
+    if local is not None:
+        parsed, payload = local
+        LRCLIB_CACHE[key] = parsed
+        lyric_cache_put(key, {**payload, "trackName": title,
+                              "artistName": artist, "duration": dur})
+        return parsed
     fail_at = LRCLIB_FAIL.get(key)
     if fail_at is not None and time.monotonic() - fail_at < LRCLIB_RETRY_BACKOFF:
         return empty_lyrics()
@@ -824,6 +904,16 @@ def fetch_lyrics(title, artist, dur):
             })
             if results:
                 payload = max(results, key=lambda item: lrclib_score(item, title, artist, dur))
+        if payload is None and dur and dur > 0:
+            # Artist-blind last resort: YT Music's artist (e.g. Thai script) may not
+            # match lrclib's romanized artist at all, so search by title only — then
+            # require a HARD ±2s duration match so a same-title cover can't slip in.
+            results = lrclib_json("/api/search", {"track_name": title})
+            if results:
+                cand = max(results, key=lambda item: lrclib_score(item, title, "", dur))
+                cand_dur = int(cand.get("duration") or 0)
+                if cand_dur and abs(cand_dur - int(dur)) <= 2:
+                    payload = cand
     except (TimeoutError, socket.timeout, urllib.error.URLError, json.JSONDecodeError) as e:
         LRCLIB_FAIL[key] = time.monotonic()
         if not LRCLIB_WARNED:

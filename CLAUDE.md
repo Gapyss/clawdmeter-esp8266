@@ -277,6 +277,25 @@ feat. in title) and the duration must match. The **running** daemon checks its
 in-memory `LRCLIB_CACHE` before disk, so if it already cached a miss this session,
 restart it to pick up a freshly inserted entry.
 
+**The exact-key requirement is softened by a tolerant fallback** (`fetch_lyrics`):
+the same recording shows up under different keys because YT Music reports it
+inconsistently across contexts along three axes — a cosmetic **title suffix**
+(`(Remastered 2015)`, `- Remastered`, `(Original Version)`), a **different-script
+artist** (Thai `บอย โกสิยพงษ์` vs romanized `Boyd Kosiyabong`), or **±1s duration
+drift** (Live & Learn cached at both 334 and 335). After the exact RAM/disk lookups
+miss, `tolerant_cache_lookup()` does an **artist-blind, title-canonical, ±2s** scan
+of the persistent cache (a free full-table scan over the tiny db), and on a hit
+write-throughs under the live key so the next play is an exact O(1) hit. If the song
+was never cached at all, a final **artist-blind lrclib `/api/search` by title only**
+runs, gated identically. The ±2s duration gate is **hard, by design** — it's the only
+discriminator once the artist is dropped, so two same-title covers (Beatles vs John
+Denver "Let It Be", 231s vs 219s) can never collide or poison the cache. `_canonical_title`
+strips remaster/version/mono/stereo markers but **deliberately keeps `(Live)`/`(Acoustic)`/
+`(Demo)`** — those are different recordings with different lyrics. `lyric_key` itself is
+left **exact** (no key migration), so manual `add_lyrics.py` entries still match by shape;
+the fallback only widens reads. This is why you rarely need to hand-add a song that's
+already cached under a romanized-artist or remaster variant.
+
 ## Constants worth knowing before editing
 
 - Display pins / SPI / rotation / default brightness: `#define`s at the top of
